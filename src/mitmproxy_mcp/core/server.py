@@ -45,7 +45,7 @@ logger = structlog.get_logger()
 
 
 class MitmController:
-    def __init__(self):
+    def __init__(self, dump_file: Optional[str] = None):
         self.master: Optional[DumpMaster] = None
         self.proxy_task: Optional[asyncio.Task] = None
         self.scope_config = ScopeConfig()
@@ -55,6 +55,7 @@ class MitmController:
         self.running = False
         self.port = 8080
         self.session_variables = {}
+        self.dump_file = dump_file
 
     def _get_verify_param(self, verify_override: Optional[bool] = None) -> Any:
         if verify_override is not None:
@@ -66,7 +67,7 @@ class MitmController:
 
         return True
 
-    async def start(self, port: int = 8080, host: str = "127.0.0.1"):
+    async def start(self, port: int = 8080, host: str = "127.0.0.1", dump_file: Optional[str] = None):
         if self.running:
             return "MITM is already running."
 
@@ -80,10 +81,18 @@ class MitmController:
         self.master.addons.add(self.recorder)
         self.master.addons.add(self.interceptor)
 
+        save_path = dump_file or self.dump_file
+        if save_path:
+            opts.update(save_stream_file=save_path)
+            logger.info("flow_dump_enabled", path=save_path)
+
         self.proxy_task = asyncio.create_task(self.master.run())
         self.running = True
         logger.info("proxy_started", host=host, port=port)
-        return f"Started proxy on port {port}"
+        msg = f"Started proxy on port {port}"
+        if save_path:
+            msg += f", dumping flows to {save_path}"
+        return msg
 
     async def stop(self):
         if not self.running or not self.master:
@@ -207,9 +216,16 @@ mcp = FastMCP("Mitmproxy Manager")
 
 
 @mcp.tool()
-async def start_proxy(port: int = 8080) -> str:
+async def start_proxy(port: int = 8080, dump_file: str = None) -> str:
+    """
+    Start the mitmproxy instance.
+    Args:
+        port: Port to listen on (default 8080)
+        dump_file: Optional file path to save raw mitmproxy .flow data.
+            Prefix with + to append to an existing file.
+    """
     try:
-        return await controller.start(port=port)
+        return await controller.start(port=port, dump_file=dump_file)
     except Exception as e:
         logger.error("proxy_start_failed", error=str(e))
         return f"Couldn't start the proxy: {str(e)}"
@@ -1508,6 +1524,20 @@ async def generate_scraper_code(flow_ids: str, target_framework: str = "curl_cff
 
 def start():
     """Entry point for running the server directly."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="mitmproxy-mcp server")
+    parser.add_argument(
+        "--dump-file",
+        default=os.environ.get("MITMPROXY_DUMP_FILE"),
+        help="Path to save raw .flow data. Prefix with + to append. "
+        "Can also be set via MITMPROXY_DUMP_FILE env var.",
+    )
+    args, _ = parser.parse_known_args()
+
+    global controller
+    controller = MitmController(dump_file=args.dump_file)
+
     mcp.run()
 
 
