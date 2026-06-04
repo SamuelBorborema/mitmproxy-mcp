@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import json
+from pathlib import Path
 from collections import Counter
 from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import urlparse, parse_qs, urlencode, parse_qsl
@@ -440,10 +441,23 @@ async def load_traffic_file(
     scope_list = (
         [d.strip() for d in scope.split(",") if d.strip()] if scope else None
     )
+
+    # Security: Prevent path traversal and restrict to working directory
+    try:
+        requested_path = Path(file_path).resolve()
+        base_dir = Path.cwd().resolve()
+        if not str(requested_path).startswith(str(base_dir)):
+            return json.dumps({
+                "status": "error",
+                "message": f"Security Error: Access denied to {file_path}. Path must be within the project directory."
+            })
+    except Exception as e:
+        return json.dumps({"status": "error", "message": f"Invalid path: {str(e)}"})
+
     try:
         stats = await asyncio.to_thread(
             controller.recorder.db.import_from_file,
-            file_path, append=append, scope=scope_list
+            str(requested_path), append=append, scope=scope_list
         )
         return json.dumps(
             {
