@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mitmproxy-mcp"
-version = "0.6.0"
+version = "0.6.1"
 description = "MITM proxy manager with MCP integration"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
@@ -52,6 +52,10 @@ mitmproxy-mcp = "mitmproxy_mcp.core.server:start"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.package-data]
+mitmproxy_mcp = ["templates/*.jinja2"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
