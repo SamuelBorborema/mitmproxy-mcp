@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import json
+from pathlib import Path
 from collections import Counter
 from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import urlparse, parse_qs, urlencode, parse_qsl
@@ -57,6 +58,7 @@ class MitmController:
         self.port = 8080
         self.session_variables = {}
         self.dump_file = dump_file
+        self.cli_upstream_proxy: Optional[str] = None
 
     def _get_verify_param(self, verify_override: Optional[bool] = None) -> Any:
         if verify_override is not None:
@@ -68,12 +70,24 @@ class MitmController:
 
         return True
 
-    async def start(self, port: int = 8080, host: str = "127.0.0.1", dump_file: Optional[str] = None):
+    async def start(
+        self,
+        port: int = 8080,
+        host: str = "127.0.0.1",
+        dump_file: Optional[str] = None,
+        upstream_proxy: Optional[str] = None,
+    ):
         if self.running:
             return "MITM is already running."
 
         self.port = port
         opts = options.Options(listen_host=host, listen_port=port)
+
+        up_proxy = upstream_proxy or self.cli_upstream_proxy
+        if up_proxy:
+            opts.update(mode=f"upstream:{up_proxy}")
+            logger.info("upstream_proxy_configured", url=up_proxy)
+
         self.master = DumpMaster(
             opts,
             with_termlog=False,
@@ -217,16 +231,21 @@ mcp = FastMCP("Mitmproxy Manager")
 
 
 @mcp.tool()
-async def start_proxy(port: int = 8080, dump_file: str = None) -> str:
+async def start_proxy(
+    port: int = 8080, dump_file: Optional[str] = None, upstream_proxy: Optional[str] = None
+) -> str:
     """
     Start the mitmproxy instance.
     Args:
         port: Port to listen on (default 8080)
         dump_file: Optional file path to save raw mitmproxy .flow data.
             Prefix with + to append to an existing file.
+        upstream_proxy: Optional upstream proxy URL (e.g., 'http://user:pass@proxy:port').
     """
     try:
-        return await controller.start(port=port, dump_file=dump_file)
+        return await controller.start(
+            port=port, dump_file=dump_file, upstream_proxy=upstream_proxy
+        )
     except Exception as e:
         logger.error("proxy_start_failed", error=str(e))
         return f"Couldn't start the proxy: {str(e)}"
@@ -422,10 +441,23 @@ async def load_traffic_file(
     scope_list = (
         [d.strip() for d in scope.split(",") if d.strip()] if scope else None
     )
+
+    # Security: Prevent path traversal and restrict to working directory
+    try:
+        requested_path = Path(file_path).resolve()
+        base_dir = Path.cwd().resolve()
+        if not str(requested_path).startswith(str(base_dir)):
+            return json.dumps({
+                "status": "error",
+                "message": f"Security Error: Access denied to {file_path}. Path must be within the project directory."
+            })
+    except Exception as e:
+        return json.dumps({"status": "error", "message": f"Invalid path: {str(e)}"})
+
     try:
         stats = await asyncio.to_thread(
             controller.recorder.db.import_from_file,
-            file_path, append=append, scope=scope_list
+            str(requested_path), append=append, scope=scope_list
         )
         return json.dumps(
             {
@@ -1225,10 +1257,18 @@ def start():
         help="Path to save raw .flow data. Prefix with + to append. "
         "Can also be set via MITMPROXY_DUMP_FILE env var.",
     )
+    parser.add_argument(
+        "--upstream-proxy",
+        default=os.environ.get("MITMPROXY_UPSTREAM_PROXY"),
+        help="Upstream proxy URL (e.g., http://user:pass@proxy:port). "
+        "Can also be set via MITMPROXY_UPSTREAM_PROXY env var.",
+    )
     args, _ = parser.parse_known_args()
 
     global controller
+    # Store CLI upstream proxy if provided
     controller = MitmController(dump_file=args.dump_file)
+    controller.cli_upstream_proxy = args.upstream_proxy
 
     mcp.run()
 
