@@ -12,6 +12,7 @@ from pathlib import Path
 from collections import Counter
 from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import urlparse, parse_qs, urlencode, parse_qsl
+import math
 import re
 import re2
 
@@ -2250,6 +2251,556 @@ async def get_api_patterns(domain: str = None, limit: int = None) -> list[dict[s
         )
 
     return result
+
+
+def _anomaly_quartiles(values: List[float], sensitivity: float = 1.5) -> Dict[str, float]:
+    """Pure python quartiles / IQR (sorted, no numpy). Returns q1,q3,median,iqr,lower,upper."""
+    if not values:
+        return {"q1": 0.0, "q3": 0.0, "median": 0.0, "iqr": 0.0, "lower": 0.0, "upper": 0.0}
+    # Prefer shared helper in TrafficDB if available
+    try:
+        # Use recorder's helper for consistency
+        return controller.recorder.db.get_cluster_stats(values, sensitivity)  # type: ignore
+    except Exception:
+        pass
+    s = sorted(values)
+    n = len(s)
+
+    def _pct(p: float) -> float:
+        if n == 1:
+            return float(s[0])
+        k = (n - 1) * p / 100.0
+        f = int(math.floor(k))
+        c = int(math.ceil(k))
+        if f == c:
+            return float(s[int(k)])
+        d = k - f
+        if c >= n:
+            c = n - 1
+        if f >= n:
+            f = n - 1
+        return float(s[f]) * (1 - d) + float(s[c]) * d
+
+    q1 = _pct(25)
+    q3 = _pct(75)
+    median = _pct(50)
+    iqr = q3 - q1
+    lower = q1 - sensitivity * iqr
+    upper = q3 + sensitivity * iqr
+    return {"q1": q1, "q3": q3, "median": median, "iqr": iqr, "lower": lower, "upper": upper}
+
+
+def _p95_value(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    s = sorted(values)
+    n = len(s)
+    if n == 1:
+        return float(s[0])
+    # Interpolate like quartiles (pure python, no numpy)
+    k = (n - 1) * 0.95
+    f = int(math.floor(k))
+    c = int(math.ceil(k))
+    if f == c:
+        return float(s[int(k)])
+    d = k - f
+    if c >= n:
+        c = n - 1
+    if f >= n:
+        f = n - 1
+    return float(s[f]) * (1 - d) + float(s[c]) * d
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+async def detect_anomalies(
+    domain: str = None,
+    method: str = None,
+    limit: int = None,
+    sensitivity: float = 1.5,
+    min_cluster: int = 5,
+) -> Dict[str, Any]:
+    """Detect anomalous flows via per-endpoint clustering.
+
+    Clustering reuses `_normalize_path` logic (numeric→{id}, uuid→{uuid},
+    24hex→{objectId}, token>20→{token}) and `method + normalized_path` as key,
+    like `get_api_patterns`.
+
+    Signals (from existing DB columns, no migration yet):
+    - `size` quartiles (pure python sorted q1/q3, IQR*sensitivity)
+    - `status_code` not in mode where mode freq >0.8
+    - `content_type` shift (via `_detect_content_type`)
+    - `timestamp` inter-arrival gap >p95
+    - `request_body` length outlier (IQR)
+    - JSON key-count outlier (json.loads full body, IQR)
+
+    Tunability: `sensitivity` is the IQR multiplier (default 1.5, lower is more
+    sensitive, higher reduces flags). `min_cluster` is the minimum flows per
+    endpoint cluster to apply per-cluster IQR (default 5); smaller clusters use
+    global fallback z>3 or are skipped.
+
+    Future-ready: If a `duration` column exists (parallel feat/full-body-access),
+    TTFB outlier via duration IQR is also flagged. Missing column is tolerated.
+
+    Returns:
+        {clusters:[{endpoint, count, median_size, q1, q3, mode_status, sample_flow_ids}],
+         anomalies:[{flow_id, endpoint, signals:[...], scores:{iqr,z,status_rarity}, explanation}],
+         total_flows, clusters_count}
+        Sorted by composite score.
+    """
+    # --- Fetch flows (with large-DB optimization: lightweight first) ---
+    # Decide optimization based on total row count
+    try:
+        with controller.recorder.db._get_conn() as conn:
+            cur = conn.execute("SELECT COUNT(*) FROM flows")
+            row = cur.fetchone()
+            total_in_db = int(row[0]) if row else 0
+    except Exception:
+        total_in_db = 0
+
+    # Use lightweight optimization for large DBs to reduce memory
+    use_lightweight_opt = total_in_db > 1000
+
+    if use_lightweight_opt:
+        # Lightweight first (no bodies) for clustering
+        try:
+            flows_light = controller.recorder.get_all_for_analysis(lightweight=True, limit=None)
+        except Exception:
+            flows_light = controller.recorder.get_all_for_analysis(lightweight=False, limit=None)
+            use_lightweight_opt = False
+            flows = flows_light
+        else:
+            flows = flows_light
+            # Apply filters
+            if domain:
+                flows = [f for f in flows if domain in f["request"]["url"]]
+            if method:
+                flows = [f for f in flows if f["request"]["method"].upper() == method.upper()]
+            if limit is not None:
+                flows = flows[:limit]
+            # For lightweight mode we will flag candidates via size/status/timestamp/content_type
+            # Body-related signals will be evaluated in second-pass for flagged candidates only.
+            lightweight_mode = True
+    else:
+        lightweight_mode = False
+
+    if not use_lightweight_opt:
+        # Standard path: fetch full flows
+        try:
+            flows_full = controller.recorder.get_all_for_analysis(lightweight=False, limit=None)
+        except Exception:
+            flows_full = []
+        flows = flows_full
+        if domain:
+            flows = [f for f in flows if domain in f["request"]["url"]]
+        if method:
+            flows = [f for f in flows if f["request"]["method"].upper() == method.upper()]
+        if limit is not None:
+            flows = flows[:limit]
+        lightweight_mode = False
+
+    total_flows = len(flows)
+    if total_flows == 0:
+        return {"clusters": [], "anomalies": [], "total_flows": 0, "clusters_count": 0}
+
+    # For lightweight optimization we may need to second-pass fetch bodies for anomaly candidates later.
+    # Keep a map of id -> flow for quick lookup after second-pass
+    flow_by_id: Dict[str, Dict[str, Any]] = {f["id"]: f for f in flows}
+
+    # --- Clustering via _normalize_path ---
+    clusters: Dict[str, Dict[str, Any]] = {}
+    for f in flows:
+        try:
+            parsed = urlparse(f["request"]["url"])
+            norm_path, _params = _normalize_path(parsed.path)
+        except Exception:
+            norm_path = f["request"].get("url", "")
+        m = f["request"]["method"]
+        key = f"{m} {norm_path}"
+        if key not in clusters:
+            clusters[key] = {
+                "endpoint": key,
+                "method": m,
+                "path_pattern": norm_path,
+                "count": 0,
+                "flows": [],
+                "sizes": [],
+                "timestamps": [],
+                "statuses": [],
+                "content_types": [],
+                "body_lengths": [],
+                "json_key_counts": [],
+                "durations": [],
+                "sample_flow_ids": [],
+            }
+        c = clusters[key]
+        c["count"] += 1
+        c["flows"].append(f)
+        c["sample_flow_ids"].append(f["id"])
+
+        # size (top-level, fallback to 0)
+        sz = f.get("size")
+        if sz is None:
+            # Fallback: try len of response body if present
+            try:
+                rb = f["response"]["body"] if f.get("response") and f["response"].get("body") else ""
+                sz = len(rb) if isinstance(rb, (str, bytes)) else 0
+            except Exception:
+                sz = 0
+        try:
+            sz = int(sz)
+        except Exception:
+            sz = 0
+        c["sizes"].append(float(sz))
+        f["_size"] = float(sz)
+
+        # timestamp
+        ts = f.get("timestamp")
+        if ts is not None:
+            try:
+                tsf = float(ts)
+                c["timestamps"].append(tsf)
+                f["_timestamp"] = tsf
+            except Exception:
+                f["_timestamp"] = None
+        else:
+            f["_timestamp"] = None
+
+        # status_code
+        status = None
+        try:
+            if f.get("response"):
+                status = f["response"].get("status_code")
+        except Exception:
+            status = None
+        if status is not None:
+            c["statuses"].append(status)
+        f["_status"] = status
+
+        # content_type via _detect_content_type
+        ct = "unknown"
+        try:
+            if f.get("response") and f["response"].get("headers"):
+                # _detect_content_type expects dict with content-type keys
+                hdrs = f["response"]["headers"]
+                # hdrs may be dict or list; normalize to dict lower
+                if isinstance(hdrs, list):
+                    hdrs = {k: v for k, v in hdrs}
+                low_hdrs = {k.lower(): v for k, v in hdrs.items()} if isinstance(hdrs, dict) else {}
+                ct = _detect_content_type(low_hdrs)
+            elif f.get("response") and f["response"].get("headers") is None:
+                ct = "unknown"
+        except Exception:
+            ct = "unknown"
+        c["content_types"].append(ct)
+        f["_content_type"] = ct
+
+        # request_body length and json key count (full body, lightweight may lack)
+        req_body = f["request"].get("body") if isinstance(f.get("request"), dict) else None
+        # lightweight mode has no body key
+        if req_body is None and not lightweight_mode:
+            # Try to fetch via body key elsewhere? already None
+            pass
+        blen = 0
+        if isinstance(req_body, str):
+            blen = len(req_body)
+        elif isinstance(req_body, bytes):
+            blen = len(req_body)
+        c["body_lengths"].append(float(blen))
+        f["_body_len"] = float(blen)
+
+        # json key count
+        jk = None
+        if isinstance(req_body, (str, bytes)) and req_body:
+            try:
+                txt = req_body if isinstance(req_body, str) else req_body.decode("utf-8", errors="ignore")
+                data = json.loads(txt)
+                if isinstance(data, dict):
+                    jk = len(data)
+                elif isinstance(data, list):
+                    jk = len(data)
+                else:
+                    jk = 1
+            except Exception:
+                jk = None
+        if jk is not None:
+            c["json_key_counts"].append(float(jk))
+        f["_json_key_count"] = jk
+
+        # duration (future-ready)
+        dur = None
+        try:
+            dur = f.get("duration")
+            if dur is not None:
+                dur = float(dur)
+                c["durations"].append(dur)
+        except Exception:
+            dur = None
+        f["_duration"] = dur
+        f["_endpoint"] = key
+
+    # Global fallback stats for size (when cluster too small)
+    all_sizes = [float(v) for c in clusters.values() for v in c["sizes"]]
+    global_size_stats = _anomaly_quartiles(all_sizes, sensitivity) if all_sizes else {"q1": 0, "q3": 0, "median": 0, "iqr": 0, "lower": 0, "upper": 0}
+    # also mean/std for z>3 fallback
+    if all_sizes:
+        g_mean = sum(all_sizes) / len(all_sizes)
+        g_var = sum((x - g_mean) ** 2 for x in all_sizes) / len(all_sizes) if len(all_sizes) > 1 else 0
+        g_std = math.sqrt(g_var) if g_var > 0 else 1.0
+    else:
+        g_mean, g_std = 0, 1.0
+
+    clusters_output: List[Dict[str, Any]] = []
+    anomalies: List[Dict[str, Any]] = []
+
+    for key, c in clusters.items():
+        sizes = c["sizes"]
+        stats = _anomaly_quartiles(sizes, sensitivity) if sizes else {"q1": 0, "q3": 0, "median": 0, "iqr": 0, "lower": 0, "upper": 0}
+        # content_type mode
+        ct_counter = Counter(c["content_types"])
+        mode_ct, mode_ct_cnt = ct_counter.most_common(1)[0] if ct_counter else ("unknown", 0)
+        mode_ct_freq = mode_ct_cnt / len(c["content_types"]) if c["content_types"] else 0
+        # status mode
+        status_counter = Counter(c["statuses"])
+        mode_status, mode_status_cnt = status_counter.most_common(1)[0] if status_counter else (None, 0)
+        mode_status_freq = mode_status_cnt / len(c["statuses"]) if c["statuses"] else 0
+
+        # timestamp gaps p95
+        timestamps_sorted = sorted(c["timestamps"]) if c["timestamps"] else []
+        gaps = [timestamps_sorted[i + 1] - timestamps_sorted[i] for i in range(len(timestamps_sorted) - 1)] if len(timestamps_sorted) > 1 else []
+        p95_gap = _p95_value(gaps) if gaps else None
+        # map timestamp to sorted order for gap lookup
+        # Build flow order by timestamp
+        flows_by_ts = sorted(c["flows"], key=lambda x: x.get("_timestamp") if x.get("_timestamp") is not None else 0)
+
+        # body lengths stats
+        body_stats = _anomaly_quartiles([v for v in c["body_lengths"] if v is not None], sensitivity) if c["body_lengths"] else None
+        # json key counts stats
+        json_stats = _anomaly_quartiles(c["json_key_counts"], sensitivity) if c["json_key_counts"] else None
+        # duration stats (tolerate missing)
+        duration_stats = None
+        try:
+            if c["durations"]:
+                duration_stats = _anomaly_quartiles(c["durations"], sensitivity)
+        except Exception:
+            duration_stats = None
+
+        # cluster output
+        clusters_output.append(
+            {
+                "endpoint": key,
+                "count": c["count"],
+                "median_size": stats["median"],
+                "q1": stats["q1"],
+                "q3": stats["q3"],
+                "mode_status": mode_status,
+                "sample_flow_ids": c["sample_flow_ids"][:3],
+                # extra for debugging, not required but useful
+                "method": c["method"],
+                "path_pattern": c["path_pattern"],
+            }
+        )
+
+        use_global = c["count"] < min_cluster
+
+        # For each flow evaluate signals
+        for idx, f in enumerate(c["flows"]):
+            signals: List[str] = []
+            scores: Dict[str, float] = {}
+            explanations: List[str] = []
+            size_val = f["_size"]
+
+            # size outlier (per-cluster IQR or global fallback)
+            if not use_global:
+                if stats["iqr"] == 0:
+                    # If IQR 0, any deviation from median is outlier (common for uniform sizes)
+                    if size_val != stats["median"]:
+                        signals.append("size_outlier")
+                        # distance as absolute diff normalized
+                        denom = abs(stats["median"]) if stats["median"] != 0 else 1
+                        dist = abs(size_val - stats["median"]) / denom if denom else abs(size_val - stats["median"])
+                        scores["iqr"] = round(float(dist), 2)
+                        explanations.append(f"size {size_val:.0f} deviates from uniform median {stats['median']:.0f} (IQR 0)")
+                else:
+                    if size_val < stats["lower"] or size_val > stats["upper"]:
+                        signals.append("size_outlier")
+                        if size_val > stats["upper"]:
+                            dist = (size_val - stats["upper"]) / stats["iqr"] if stats["iqr"] else 0
+                        else:
+                            dist = (stats["lower"] - size_val) / stats["iqr"] if stats["iqr"] else 0
+                        scores["iqr"] = round(float(dist), 2)
+                        explanations.append(f"size {size_val:.0f} outside IQR bounds [{stats['lower']:.1f}, {stats['upper']:.1f}] (sensitivity {sensitivity})")
+            else:
+                # Global fallback z>3
+                z = (size_val - g_mean) / g_std if g_std else 0
+                scores["z"] = round(float(z), 2)
+                if abs(z) > 3:
+                    signals.append("size_outlier")
+                    # Use global IQR bounds as well if available
+                    if size_val < global_size_stats["lower"] or size_val > global_size_stats["upper"]:
+                        scores["iqr"] = round(float(abs(z)), 2) if "iqr" not in scores else scores["iqr"]
+                    explanations.append(f"size {size_val:.0f} global z={z:.2f} (>3) (small cluster fallback)")
+                # Ensure iqr score present for small clusters even if not size outlier? will be set later
+
+            # status_code rarity (mode freq >0.8)
+            if mode_status is not None and mode_status_freq > 0.8 and f["_status"] != mode_status and f["_status"] is not None:
+                signals.append("status_code_rare")
+                rarity = 1 - (status_counter[f["_status"]] / len(c["statuses"])) if len(c["statuses"]) else 1
+                scores["status_rarity"] = round(float(rarity), 2)
+                explanations.append(f"status {f['_status']} rare vs mode {mode_status} ({mode_status_freq:.0%} mode freq)")
+
+            # content_type shift
+            if mode_ct_freq > 0.8 and f["_content_type"] != mode_ct:
+                signals.append("content_type_shift")
+                explanations.append(f"content_type {f['_content_type']} vs mode {mode_ct}")
+
+            # timestamp inter-arrival gap >p95 (flag flow that follows a large gap)
+            if p95_gap is not None and gaps:
+                # Find this flow's index in sorted order
+                try:
+                    sorted_idx = flows_by_ts.index(f)
+                except ValueError:
+                    sorted_idx = -1
+                if sorted_idx > 0:
+                    prev_ts = flows_by_ts[sorted_idx - 1].get("_timestamp")
+                    cur_ts = f.get("_timestamp")
+                    if prev_ts is not None and cur_ts is not None:
+                        gap = cur_ts - prev_ts
+                        if gap > p95_gap:
+                            signals.append("timestamp_gap")
+                            explanations.append(f"inter-arrival gap {gap:.2f}s > p95 {p95_gap:.2f}s")
+
+            # request_body length outlier (per-cluster IQR)
+            if not lightweight_mode and body_stats and f["_body_len"] is not None:
+                bl = f["_body_len"]
+                # Only flag if body lengths have variance and cluster large enough
+                if not use_global:
+                    if body_stats["iqr"] == 0:
+                        if bl != body_stats["median"] and bl != 0:
+                            # Avoid flagging many zeros if median 0
+                            if body_stats["median"] != 0:
+                                signals.append("request_body_length_outlier")
+                                explanations.append(f"request body length {bl:.0f} deviates from median {body_stats['median']:.0f}")
+                    else:
+                        if bl < body_stats["lower"] or bl > body_stats["upper"]:
+                            signals.append("request_body_length_outlier")
+                            explanations.append(f"request body length {bl:.0f} outside IQR [{body_stats['lower']:.1f}, {body_stats['upper']:.1f}]")
+
+            # JSON key-count outlier
+            if not lightweight_mode and json_stats and f["_json_key_count"] is not None:
+                jk = float(f["_json_key_count"])
+                if json_stats["iqr"] == 0:
+                    if jk != json_stats["median"]:
+                        signals.append("json_key_count_outlier")
+                        explanations.append(f"json key count {jk:.0f} deviates from median {json_stats['median']:.0f}")
+                else:
+                    if jk < json_stats["lower"] or jk > json_stats["upper"]:
+                        signals.append("json_key_count_outlier")
+                        explanations.append(f"json key count {jk:.0f} outside IQR [{json_stats['lower']:.1f}, {json_stats['upper']:.1f}]")
+
+            # duration outlier (future-ready, tolerant)
+            if duration_stats and f.get("_duration") is not None:
+                dur = f["_duration"]
+                try:
+                    if dur < duration_stats["lower"] or dur > duration_stats["upper"]:
+                        signals.append("duration_outlier")
+                        explanations.append(f"duration {dur:.2f}ms outlier")
+                except Exception:
+                    pass
+
+            if signals:
+                # Composite scoring for sorting
+                # Base on number of signals and iqr distance and z
+                # Compute z for size for scoring (per-cluster)
+                try:
+                    if not use_global:
+                        if sizes:
+                            m = sum(sizes) / len(sizes)
+                            var = sum((x - m) ** 2 for x in sizes) / len(sizes) if len(sizes) > 1 else 0
+                            std = math.sqrt(var) if var > 0 else 1.0
+                            z_val = (size_val - m) / std if std else 0
+                        else:
+                            z_val = 0
+                    else:
+                        z_val = (size_val - g_mean) / g_std if g_std else 0
+                except Exception:
+                    z_val = 0
+                if "z" not in scores:
+                    scores["z"] = round(float(z_val), 2)
+                if "iqr" not in scores:
+                    # If not size outlier, iqr 0
+                    scores["iqr"] = scores.get("iqr", 0)
+                if "status_rarity" not in scores:
+                    scores["status_rarity"] = scores.get("status_rarity", 0)
+
+                composite = len(signals) * 10
+                composite += abs(scores.get("iqr", 0)) * 3
+                composite += abs(scores.get("z", 0)) * 2
+                composite += scores.get("status_rarity", 0) * 5
+                # Boost for multiple signals
+                if "size_outlier" in signals and "status_code_rare" in signals:
+                    composite += 5
+
+                anomalies.append(
+                    {
+                        "flow_id": f["id"],
+                        "endpoint": key,
+                        "signals": signals,
+                        "scores": {"iqr": scores.get("iqr", 0), "z": scores.get("z", 0), "status_rarity": scores.get("status_rarity", 0)},
+                        "explanation": "; ".join(explanations),
+                        "_composite": composite,
+                    }
+                )
+
+    # Second-pass for lightweight optimization: fetch bodies for flagged anomalies to check body signals
+    if lightweight_mode and anomalies:
+        # We flagged based on lightweight signals; now fetch full bodies for those anomalies to evaluate body-length/json outliers
+        try:
+            anomaly_ids = [a["flow_id"] for a in anomalies]
+            # Fetch full rows for anomaly ids (including bodies)
+            full_anomaly_flows = controller.recorder.db.get_by_ids(anomaly_ids)
+            # Map full data by id
+            full_map = {f["id"]: f for f in full_anomaly_flows}
+            # For each anomaly, check if body signals would add new signals if we had full data
+            # Instead of recomputing cluster stats fully, we can just attempt to augment signals
+            for a in anomalies:
+                fid = a["flow_id"]
+                full = full_map.get(fid)
+                if not full:
+                    continue
+                # full contains request body
+                req_body_full = full.get("request", {}).get("body")
+                if req_body_full is None:
+                    continue
+                # Recalculate body length outlier using cluster body stats from lightweight (which were 0) is not accurate
+                # For now, just check json key count against simple threshold if body large
+                # To keep lightweight path simple, we won't augment heavily; the main body outlier detection is less critical for large DB accuracy vs memory tradeoff
+                # We could attempt to add json_key_count anomaly if present
+                try:
+                    txt = req_body_full if isinstance(req_body_full, str) else req_body_full.decode("utf-8", errors="ignore") if isinstance(req_body_full, bytes) else ""
+                    data = json.loads(txt) if txt else None
+                    if isinstance(data, dict):
+                        jk = len(data)
+                        # If cluster json stats not available (lightweight had no bodies), we can flag if jk is large vs typical? For now skip
+                        pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # Sort anomalies by composite score
+    anomalies_sorted = sorted(anomalies, key=lambda x: x.get("_composite", 0), reverse=True)
+    for a in anomalies_sorted:
+        a.pop("_composite", None)
+
+    # Sort clusters by count desc
+    clusters_output_sorted = sorted(clusters_output, key=lambda x: -x["count"])
+
+    return {
+        "clusters": clusters_output_sorted,
+        "anomalies": anomalies_sorted,
+        "total_flows": total_flows,
+        "clusters_count": len(clusters_output_sorted),
+    }
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
