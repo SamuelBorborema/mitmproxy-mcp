@@ -1,7 +1,9 @@
 import asyncio
+import base64
 import contextlib
 import logging
 import os
+import sqlite3
 import sys
 import json
 import time
@@ -15,10 +17,13 @@ import re2
 import structlog
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ResourceNotFoundError
 from mcp.shared.subscriptions import ResourceUpdated
 from mcp.types import ToolAnnotations
 from mitmproxy import options
 from mitmproxy.tools.dump import DumpMaster
+from mitmproxy.net.http.headers import infer_content_encoding
+from mitmproxy.utils import strutils
 from curl_cffi.requests import AsyncSession
 from jsonpath_ng import parse as parse_jsonpath
 from bs4 import BeautifulSoup
@@ -473,6 +478,342 @@ async def inspect_flows(
                     req["body"] = flow_obj.body
 
     return results
+
+
+# --- Full body access helpers ---
+
+def _parse_headers_list(raw: Optional[str]) -> List[List[str]]:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return [[str(k), str(v)] for k, v in parsed]
+        return [[str(k), str(v)] for k, v in parsed.items()]
+    except Exception:
+        return []
+
+def _mime_from_headers(headers: List[List[str]]) -> str:
+    for k, v in headers:
+        if k.lower() == "content-type":
+            return v
+    return ""
+
+def _fetch_body_raw(flow_id: str, is_request: bool) -> Optional[Tuple[Optional[bytes], List[List[str]], str, Optional[int]]]:
+    """Fetch raw bytes, headers, mimeType for a flow.
+    Returns (raw_bytes, headers_list, mimeType, status_code_or_None) or None if not found.
+    Handles DB primary key lookup plus live-flow fallback when raw is NULL.
+    """
+    headers: List[List[str]] = []
+    mime_type = ""
+    raw_b64: Optional[str] = None
+    status_code: Optional[int] = None
+    found_row = False
+
+    # Try DB first
+    try:
+        with controller.recorder.db._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            if is_request:
+                cursor = conn.execute(
+                    "SELECT request_raw, request_body, request_headers, size FROM flows WHERE id=?",
+                    (flow_id,),
+                )
+            else:
+                cursor = conn.execute(
+                    "SELECT response_raw, response_body, response_headers, status_code, size FROM flows WHERE id=?",
+                    (flow_id,),
+                )
+            row = cursor.fetchone()
+            if row is not None:
+                found_row = True
+                # Extract
+                raw_b64 = row["request_raw"] if is_request else row["response_raw"]
+                headers_raw = row["request_headers"] if is_request else row["response_headers"]
+                headers = _parse_headers_list(headers_raw)
+                mime_type = _mime_from_headers(headers)
+                if not is_request:
+                    status_code = row["status_code"]
+                # Try to decode raw_b64 if present
+                if raw_b64 is not None:
+                    try:
+                        raw_bytes = base64.b64decode(raw_b64)
+                    except Exception:
+                        raw_bytes = None
+                    return (raw_bytes, headers, mime_type, status_code)
+                # raw is None -> check if row exists but raw null => fallback to live flow
+                # keep headers/mime_type/status_code but need to fetch raw from live
+            else:
+                # no row -> fallback to live flow entirely
+                pass
+    except sqlite3.OperationalError as e:
+        # column missing (old DB not migrated?) -> treat as no raw, fallback to body text
+        if "no such column" in str(e).lower():
+            # try fallback query without raw column
+            try:
+                with controller.recorder.db._get_conn() as conn2:
+                    conn2.row_factory = sqlite3.Row
+                    if is_request:
+                        cur2 = conn2.execute("SELECT request_body, request_headers FROM flows WHERE id=?", (flow_id,))
+                    else:
+                        cur2 = conn2.execute("SELECT response_body, response_headers, status_code FROM flows WHERE id=?", (flow_id,))
+                    r2 = cur2.fetchone()
+                    if r2 is not None:
+                        found_row = True
+                        headers_raw = r2["request_headers"] if is_request else r2["response_headers"]
+                        headers = _parse_headers_list(headers_raw)
+                        mime_type = _mime_from_headers(headers)
+                        if not is_request:
+                            status_code = r2["status_code"]
+                        body_text = r2["request_body"] if is_request else r2["response_body"]
+                        if body_text is not None:
+                            return (body_text.encode("utf-8", "replace"), headers, mime_type, status_code)
+                        # else fall through to live fallback
+                    else:
+                        found_row = False
+            except Exception:
+                pass
+        else:
+            raise
+
+    # Fallback to live flow if DB row had no raw or no row at all
+    live = controller.recorder.get_live_flow(flow_id)
+    if live is not None:
+        try:
+            msg = live.request if is_request else live.response
+            if msg is not None:
+                # Prefer raw_content, fallback to content
+                raw = getattr(msg, "raw_content", None)
+                if raw is None:
+                    try:
+                        raw = msg.content
+                    except Exception:
+                        raw = None
+                if raw is not None:
+                    # Need headers/mime if not already from DB
+                    if not headers:
+                        try:
+                            headers = [[k.decode("latin-1"), v.decode("latin-1")] for k, v in msg.headers.fields]
+                            mime_type = _mime_from_headers(headers)
+                        except Exception:
+                            pass
+                    if not is_request and status_code is None:
+                        # live flow response status
+                        try:
+                            status_code = live.response.status_code if live.response else None
+                        except Exception:
+                            pass
+                    return (raw, headers, mime_type, status_code)
+        except Exception:
+            pass
+
+    # If we found DB row but raw was None and live fallback also None, try to use stored body text as fallback
+    if found_row:
+        # headers already parsed, try to use body text if exists
+        try:
+            with controller.recorder.db._get_conn() as conn3:
+                conn3.row_factory = sqlite3.Row
+                if is_request:
+                    c3 = conn3.execute("SELECT request_body FROM flows WHERE id=?", (flow_id,))
+                else:
+                    c3 = conn3.execute("SELECT response_body FROM flows WHERE id=?", (flow_id,))
+                r3 = c3.fetchone()
+                if r3 is not None:
+                    body_t = r3["request_body"] if is_request else r3["response_body"]
+                    if body_t is not None:
+                        return (body_t.encode("utf-8", "replace"), headers, mime_type, status_code)
+                    else:
+                        # empty body
+                        return (b"", headers, mime_type, status_code)
+        except Exception:
+            pass
+        # still found row, return empty bytes
+        return (b"", headers, mime_type, status_code)
+
+    # Not found anywhere
+    return None
+
+def _body_to_text(raw_bytes: Optional[bytes], mime_type: str, encoding: str) -> Tuple[str, bool, str]:
+    """Convert raw_bytes to text according to encoding param.
+    Returns (text, is_base64, effective_encoding)
+    """
+    if raw_bytes is None:
+        raw_bytes = b""
+    if encoding not in ("auto", "text", "base64"):
+        encoding = "auto"
+    effective = encoding
+    is_b64 = False
+    text = ""
+    if encoding == "base64":
+        is_b64 = True
+        effective = "base64"
+        text = base64.b64encode(raw_bytes).decode("ascii") if raw_bytes else ""
+    elif encoding == "text":
+        is_b64 = False
+        effective = "text"
+        enc = infer_content_encoding(mime_type, raw_bytes)
+        try:
+            text = raw_bytes.decode(enc, errors="replace")
+        except Exception:
+            text = raw_bytes.decode("utf-8", errors="replace")
+    else:  # auto
+        if raw_bytes and strutils.is_mostly_bin(raw_bytes):
+            is_b64 = True
+            effective = "base64"
+            text = base64.b64encode(raw_bytes).decode("ascii")
+        else:
+            is_b64 = False
+            effective = "text"
+            enc = infer_content_encoding(mime_type, raw_bytes)
+            try:
+                text = raw_bytes.decode(enc, errors="replace")
+            except Exception:
+                text = raw_bytes.decode("utf-8", errors="replace")
+    return text, is_b64, effective
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
+async def get_request_body(flow_id: str, offset: int = 0, limit: int = 1_000_000, encoding: str = "auto") -> Dict[str, Any]:
+    """Get full request body with chunked/paginated access.
+
+    Returns full body even when it exceeds the 2000-char preview limit in inspect_flow.
+    Supports pagination via offset/limit and binary detection.
+
+    Args:
+        flow_id: The ID of the captured flow
+        offset: Byte/char offset to start reading from (default 0)
+        limit: Max chars to return (default 1_000_000). Use pagination for large bodies.
+        encoding: "auto" (default, detect via is_mostly_bin), "text" (force text via infer_content_encoding), or "base64" (force base64)
+
+    Returns:
+        Dict with flow_id, headers (ordered [[k,v],...]), mimeType, size (chunk length), total_size (full length), is_base64, encoding (effective), truncated, next_offset, text (chunk)
+    """
+    if encoding not in ("auto", "text", "base64"):
+        return {"error": f"Invalid encoding '{encoding}'. Must be one of auto, text, base64.", "flow_id": flow_id}
+    if offset < 0:
+        offset = 0
+    if limit < 0:
+        limit = 0
+
+    fetched = _fetch_body_raw(flow_id, is_request=True)
+    if fetched is None:
+        return {"error": "Couldn't find that flow.", "flow_id": flow_id}
+    raw_bytes, headers, mime_type, _ = fetched
+    text, is_b64, eff_enc = _body_to_text(raw_bytes, mime_type, encoding)
+    total = len(text)
+    # Clamp offset
+    if offset > total:
+        offset = total
+    end = offset + limit
+    chunk = text[offset:end]
+    truncated = end < total
+    next_off = end if truncated else None
+    return {
+        "flow_id": flow_id,
+        "headers": headers,
+        "mimeType": mime_type,
+        "size": len(chunk),
+        "total_size": total,
+        "is_base64": is_b64,
+        "encoding": eff_enc,
+        "truncated": truncated,
+        "next_offset": next_off,
+        "text": chunk,
+    }
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
+async def get_response_body(flow_id: str, offset: int = 0, limit: int = 1_000_000, encoding: str = "auto") -> Dict[str, Any]:
+    """Get full response body with chunked/paginated access.
+
+    Returns full body even when it exceeds the 2000-char preview limit in inspect_flow.
+    Supports pagination via offset/limit and binary detection. For binary content (e.g. PNG) returns base64 when encoding is auto.
+
+    Args:
+        flow_id: The ID of the captured flow
+        offset: Char offset to start reading from (default 0)
+        limit: Max chars to return (default 1_000_000). Use pagination for large bodies. Pagination is recommended for bodies larger than 1MB.
+        encoding: "auto" (default, detect via is_mostly_bin), "text" (force text via infer_content_encoding), or "base64" (force base64)
+
+    Returns:
+        Dict with flow_id, headers (ordered [[k,v],...]), mimeType, status_code, size (chunk length), total_size (full length), is_base64, encoding (effective), truncated, next_offset, text (chunk). For pagination, repeatedly call with offset=next_offset until truncated is False.
+    """
+    if encoding not in ("auto", "text", "base64"):
+        return {"error": f"Invalid encoding '{encoding}'. Must be one of auto, text, base64.", "flow_id": flow_id}
+    if offset < 0:
+        offset = 0
+    if limit < 0:
+        limit = 0
+
+    fetched = _fetch_body_raw(flow_id, is_request=False)
+    if fetched is None:
+        return {"error": "Couldn't find that flow.", "flow_id": flow_id}
+    raw_bytes, headers, mime_type, status_code = fetched
+    text, is_b64, eff_enc = _body_to_text(raw_bytes, mime_type, encoding)
+    total = len(text)
+    if offset > total:
+        offset = total
+    end = offset + limit
+    chunk = text[offset:end]
+    truncated = end < total
+    next_off = end if truncated else None
+    return {
+        "flow_id": flow_id,
+        "headers": headers,
+        "mimeType": mime_type,
+        "status_code": status_code,
+        "size": len(chunk),
+        "total_size": total,
+        "is_base64": is_b64,
+        "encoding": eff_enc,
+        "truncated": truncated,
+        "next_offset": next_off,
+        "text": chunk,
+    }
+
+
+@mcp.resource("flows://{id}/request_body", mime_type="application/octet-stream")
+def flow_request_body_resource(id: str) -> str | bytes:
+    """Resource for full request body: flows://{id}/request_body
+
+    Returns the full request body for the given flow ID. Binary content is returned as bytes (served as base64 Blob), text as string. Content-Type is used to determine mime_type. For pagination use get_request_body tool with offset/limit.
+    """
+    fetched = _fetch_body_raw(id, is_request=True)
+    if fetched is None:
+        raise ResourceNotFoundError(f"Unknown resource: flows://{id}/request_body")
+    raw_bytes, headers, mime_type, _ = fetched
+    if raw_bytes is None:
+        raw_bytes = b""
+    # Auto detection for resource return type
+    if raw_bytes and strutils.is_mostly_bin(raw_bytes):
+        return raw_bytes
+    # text
+    enc = infer_content_encoding(mime_type, raw_bytes)
+    try:
+        return raw_bytes.decode(enc, errors="replace")
+    except Exception:
+        return raw_bytes.decode("utf-8", errors="replace")
+
+
+@mcp.resource("flows://{id}/response_body", mime_type="application/octet-stream")
+def flow_response_body_resource(id: str) -> str | bytes:
+    """Resource for full response body: flows://{id}/response_body
+
+    Returns the full response body for the given flow ID. Binary content is returned as bytes (served as base64 Blob), text as string. Content-Type determines decoding. For pagination use get_response_body tool with offset/limit.
+    """
+    fetched = _fetch_body_raw(id, is_request=False)
+    if fetched is None:
+        raise ResourceNotFoundError(f"Unknown resource: flows://{id}/response_body")
+    raw_bytes, headers, mime_type, _ = fetched
+    if raw_bytes is None:
+        raw_bytes = b""
+    if raw_bytes and strutils.is_mostly_bin(raw_bytes):
+        return raw_bytes
+    enc = infer_content_encoding(mime_type, raw_bytes)
+    try:
+        return raw_bytes.decode(enc, errors="replace")
+    except Exception:
+        return raw_bytes.decode("utf-8", errors="replace")
 
 
 def _json_type_name(value: Any) -> str:
@@ -992,7 +1333,7 @@ async def clear_rules() -> dict[str, Any]:
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
 async def proxy_status() -> dict[str, Any]:
-    """Return current proxy/server status."""
+    """Return current proxy/server status. Includes flow duration (time between request start and response end) stored per flow in the DB."""
     # uptime calculation is monotonic and cheap
     uptime_seconds: Optional[float] = None
     if controller.running and controller.started_at is not None:
