@@ -34,6 +34,7 @@ from .scope import ScopeManager
 from .recorder import TrafficRecorder
 from .interceptor import TrafficInterceptor
 from .generation import normalize_scraper_flows, render_scraper_code
+from .diff import diff_bodies, diff_headers, diff_size, diff_status, diff_timestamp
 
 # Configure structlog
 structlog.configure(
@@ -1715,6 +1716,292 @@ async def proxy_status() -> dict[str, Any]:
         "default_host": controller.default_host,
         "default_port": controller.default_port,
     }
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+async def diff_flows(
+    flow_ids: str,
+    compare: str = "all",
+    body_diff_mode: str = "auto",
+    context_lines: int = 5,
+    max_body_chars: int = 20000,
+    include_headers: bool = True,
+) -> dict[str, Any]:
+    """Diff n flows (mesh) anchored to first, read-only.
+
+    Args:
+        flow_ids: Comma-separated list of flow IDs (at least 2). Anchor is first.
+        compare: What to compare – all|request|response|headers|body|status.
+        body_diff_mode: How to diff bodies – auto|text|json|hex|none.
+        context_lines: Unified diff context lines.
+        max_body_chars: Guard for large bodies – sha256 + truncated preview.
+        include_headers: Whether to include header diffs.
+    """
+    allowed_compare = {"all", "request", "response", "headers", "body", "status"}
+    allowed_modes = {"auto", "text", "json", "hex", "none"}
+
+    # Validate compare / mode
+    if compare not in allowed_compare:
+        return {"error": f"Invalid compare value '{compare}'. Allowed: {sorted(allowed_compare)}"}
+    if body_diff_mode not in allowed_modes:
+        return {"error": f"Invalid body_diff_mode '{body_diff_mode}'. Allowed: {sorted(allowed_modes)}"}
+
+    # Parse ids
+    ids = [fid.strip() for fid in flow_ids.split(",") if fid.strip()]
+    if len(ids) < 2:
+        return {"error": "Need at least 2 flow IDs", "flows": ids, "compare": compare}
+
+    # Clamp context/max chars
+    if context_lines < 0:
+        context_lines = 5
+    if max_body_chars <= 0:
+        max_body_chars = 20000
+
+    # Fetch flows – ordered_headers True to preserve multiset and order
+    try:
+        fetched = controller.recorder.get_by_ids(ids, ordered_headers=True)
+    except Exception as e:
+        return {"error": f"Failed to fetch flows: {str(e)}", "flows": ids}
+
+    # Map by id and reorder to input order, detect missing
+    by_id = {f["id"]: f for f in fetched}
+    missing = [fid for fid in ids if fid not in by_id]
+    if missing:
+        return {"error": f"Flows not found: {missing}", "flows": ids, "missing": missing, "found": list(by_id.keys())}
+
+    ordered = [by_id[fid] for fid in ids]
+    anchor = ordered[0]
+    anchor_id = anchor["id"]
+
+    # Helpers to extract content-type
+    def _content_type(headers) -> Optional[str]:
+        if not headers:
+            return None
+        if isinstance(headers, dict):
+            for k, v in headers.items():
+                if k.lower() == "content-type":
+                    return v
+            return None
+        # list of [k,v]
+        for kv in headers:
+            if len(kv) >= 2 and str(kv[0]).lower() == "content-type":
+                return str(kv[1])
+        return None
+
+    def _extract(flow: dict[str, Any]) -> dict[str, Any]:
+        req = flow.get("request") or {}
+        resp = flow.get("response")
+        return {
+            "req_url": req.get("url"),
+            "req_method": req.get("method"),
+            "req_headers": req.get("headers"),
+            "req_body": req.get("body"),
+            "resp_status": resp.get("status_code") if resp else None,
+            "resp_headers": resp.get("headers") if resp else None,
+            "resp_body": resp.get("body") if resp else None,
+            "timestamp": flow.get("timestamp"),
+            "size": flow.get("size"),
+            "content_type_req": _content_type(req.get("headers")),
+            "content_type_resp": _content_type(resp.get("headers") if resp else None),
+        }
+
+    anchor_ex = _extract(anchor)
+    warnings: List[str] = []
+
+    diffs: List[Dict[str, Any]] = []
+
+    # Pre-compute anchor vs each other
+    for idx in range(1, len(ordered)):
+        other = ordered[idx]
+        other_ex = _extract(other)
+        other_id = other["id"]
+
+        # Basic status/size/timestamp diffs
+        status_diff = diff_status(anchor_ex["resp_status"], other_ex["resp_status"])
+        size_diff = diff_size(anchor_ex["size"], other_ex["size"])
+        ts_delta = diff_timestamp(anchor_ex["timestamp"], other_ex["timestamp"])
+
+        entry: Dict[str, Any] = {
+            "flow_id": other_id,
+            "anchor_id": anchor_id,
+            "status": status_diff,
+            "size": size_diff,
+            "timestamp_delta_seconds": ts_delta,
+        }
+
+        # Decide which sections to include based on compare
+        include_request = compare in ("all", "request", "headers", "body")
+        include_response = compare in ("all", "response", "headers", "body", "status")
+        # status already included; filter per compare if needed
+        if compare == "status":
+            include_request = False
+            include_response = False
+            # keep status/size/timestamp only
+            # but still allow top-level status/size
+        elif compare == "headers":
+            include_request = True
+            include_response = True
+        elif compare == "body":
+            include_request = True
+            include_response = True
+        elif compare == "request":
+            include_response = False
+        elif compare == "response":
+            include_request = False
+
+        # Request section
+        if include_request or compare == "all":
+            req_section: Dict[str, Any] = {}
+            # url/method diffs
+            req_section["url"] = {
+                "a": anchor_ex["req_url"],
+                "b": other_ex["req_url"],
+                "diff": anchor_ex["req_url"] != other_ex["req_url"],
+            }
+            req_section["method"] = {
+                "a": anchor_ex["req_method"],
+                "b": other_ex["req_method"],
+                "diff": anchor_ex["req_method"] != other_ex["req_method"],
+            }
+            if compare in ("all", "request", "headers"):
+                if include_headers:
+                    hdr_diff = diff_headers(anchor_ex["req_headers"], other_ex["req_headers"])
+                    req_section["headers"] = hdr_diff
+                else:
+                    req_section["headers"] = {"skipped": True, "reason": "include_headers=False"}
+            # body diff
+            if compare in ("all", "request", "body"):
+                body_mode = body_diff_mode if compare != "headers" else "none"
+                if compare == "headers":
+                    body_mode = "none"
+                # For compare=status, skip body
+                if compare == "status":
+                    req_section["body"] = {"diff_type": "none", "note": "skipped for compare=status"}
+                else:
+                    bdiff = diff_bodies(
+                        anchor_ex["req_body"],
+                        other_ex["req_body"],
+                        mode=body_mode,
+                        max_body_chars=max_body_chars,
+                        context_lines=context_lines,
+                        content_type_a=anchor_ex["content_type_req"],
+                        content_type_b=other_ex["content_type_req"],
+                        size_a=anchor_ex["size"],
+                        size_b=other_ex["size"],
+                    )
+                    req_section["body"] = bdiff
+                    if bdiff.get("warnings"):
+                        warnings.extend([f"request body {other_id}: {w}" for w in bdiff["warnings"]])
+                    if bdiff.get("truncated"):
+                        warnings.append(f"request body truncated for {anchor_id} vs {other_id}")
+            entry["request"] = req_section
+
+        # Response section
+        if include_response or compare == "all":
+            resp_section: Dict[str, Any] = {}
+            # status already at top, but also include in response
+            if compare in ("all", "response", "status"):
+                resp_section["status"] = status_diff
+            if compare in ("all", "response", "headers"):
+                if include_headers:
+                    hdr_diff = diff_headers(anchor_ex["resp_headers"], other_ex["resp_headers"])
+                    resp_section["headers"] = hdr_diff
+                else:
+                    resp_section["headers"] = {"skipped": True, "reason": "include_headers=False"}
+            if compare in ("all", "response", "body"):
+                # For headers/status compare, skip body
+                if compare in ("headers", "status"):
+                    resp_section["body"] = {"diff_type": "none", "note": f"skipped for compare={compare}"}
+                else:
+                    bdiff = diff_bodies(
+                        anchor_ex["resp_body"],
+                        other_ex["resp_body"],
+                        mode=body_diff_mode,
+                        max_body_chars=max_body_chars,
+                        context_lines=context_lines,
+                        content_type_a=anchor_ex["content_type_resp"],
+                        content_type_b=other_ex["content_type_resp"],
+                        size_a=anchor_ex["size"],
+                        size_b=other_ex["size"],
+                    )
+                    resp_section["body"] = bdiff
+                    if bdiff.get("warnings"):
+                        warnings.extend([f"response body {other_id}: {w}" for w in bdiff["warnings"]])
+                    if bdiff.get("truncated"):
+                        warnings.append(f"response body truncated for {anchor_id} vs {other_id}")
+                    # binary vs text warning
+                    if bdiff.get("binary") and bdiff.get("diff_type") == "text":
+                        warnings.append(f"binary response body diffed as text for {other_id}")
+            # size already at top, but also include in response if needed
+            if compare in ("all", "response"):
+                resp_section["size"] = size_diff
+            if resp_section:
+                entry["response"] = resp_section
+
+        # If compare filtering removed both request/response, ensure at least status/size remain
+        if compare == "status":
+            # already have status/size/timestamp, no need for request/response
+            pass
+        elif compare == "headers":
+            # ensure headers diff is present, body skipped
+            pass
+
+        diffs.append(entry)
+
+    # Build full matrix (n x n) for mesh
+    n = len(ordered)
+    matrix: List[List[Optional[Dict[str, Any]]]] = []
+    for i in range(n):
+        row: List[Optional[Dict[str, Any]]] = []
+        for j in range(n):
+            if i == j:
+                row.append(None)
+                continue
+            a = ordered[i]
+            b = ordered[j]
+            a_ex = _extract(a)
+            b_ex = _extract(b)
+            cell: Dict[str, Any] = {
+                "flow_a": a["id"],
+                "flow_b": b["id"],
+                "status": diff_status(a_ex["resp_status"], b_ex["resp_status"]),
+                "size": diff_size(a_ex["size"], b_ex["size"]),
+                "timestamp_delta_seconds": diff_timestamp(a_ex["timestamp"], b_ex["timestamp"]),
+            }
+            # Add lightweight url/method diff for matrix
+            cell["url_diff"] = a_ex["req_url"] != b_ex["req_url"]
+            cell["method_diff"] = a_ex["req_method"] != b_ex["req_method"]
+            # For feasibility, we don't compute full body diffs in matrix to avoid O(n^2) large diffs
+            # But include header diff counts if include_headers and compare allows
+            if include_headers and compare in ("all", "headers"):
+                hdr = diff_headers(a_ex["req_headers"], b_ex["req_headers"])
+                cell["request_headers_changed"] = bool(hdr["added"] or hdr["removed"] or hdr["modified"])
+            row.append(cell)
+        matrix.append(row)
+
+    # Deduplicate warnings while preserving order
+    seen = set()
+    uniq_warnings: List[str] = []
+    for w in warnings:
+        if w not in seen:
+            seen.add(w)
+            uniq_warnings.append(w)
+
+    result: Dict[str, Any] = {
+        "flows": ids,
+        "anchor": anchor_id,
+        "diffs": diffs,
+        "matrix": matrix,
+        "warnings": uniq_warnings,
+        "compare": compare,
+        "body_diff_mode": body_diff_mode,
+        "include_headers": include_headers,
+        "context_lines": context_lines,
+        "max_body_chars": max_body_chars,
+    }
+
+    # If no warnings, keep empty list (spec expects warnings key)
+    return result
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
