@@ -1,12 +1,13 @@
 import asyncio
 import base64
 import contextlib
+import json
 import logging
 import os
 import sqlite3
 import sys
-import json
 import time
+import zlib
 from pathlib import Path
 from collections import Counter
 from typing import List, Dict, Any, Optional, Tuple
@@ -912,6 +913,341 @@ async def load_traffic_file(
                 "errors": stats["errors"],
             }
     except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+async def export_har(
+    file_path: str,
+    flow_ids: str = None,
+    domain: str = None,
+    limit: int = None,
+    compress: bool = False,
+) -> dict[str, Any]:
+    """
+    Export captured traffic to HAR (HTTP Archive) format for use with Burp Suite, Postman, or browser devtools.
+
+    Defaults to all captured flows — use domain/limit/flow_ids to scope, otherwise large DB produces large HAR. Filterable.
+
+    Args:
+        file_path: Relative path (within project cwd) to write the HAR file. Supports .har, .zhar (compressed), and .json extensions. Must be under Path.cwd(). Parent directories are created automatically.
+        flow_ids: Comma-separated list of flow IDs to export. If provided, only those flows are exported (via get_by_ids).
+        domain: Substring filter on URL (like get_api_patterns). Only flows whose URL contains this string are exported.
+        limit: Max number of flows to export, ordered by timestamp DESC. None = no limit.
+        compress: If True, compress output with zlib (level 9). Also auto-enabled for .zhar extension.
+
+    Returns:
+        Dict with status, path, entries, bytes, and filter info. On security violation returns {"status":"error","message":"Security Error..."}.
+    """
+    # Security: Prevent path traversal and restrict to working directory
+    try:
+        requested_path = Path(file_path).resolve()
+        base_dir = Path.cwd().resolve()
+        if not str(requested_path).startswith(str(base_dir) + os.sep) and str(requested_path) != str(base_dir):
+            return {
+                "status": "error",
+                "message": f"Security Error: Access denied to {file_path}. Path must be within the project directory.",
+            }
+    except Exception as e:
+        return {"status": "error", "message": f"Invalid path: {str(e)}"}
+
+    # Validate extension and ensure parent
+    allowed_exts = (".har", ".zhar", ".json")
+    if not str(requested_path).lower().endswith(allowed_exts):
+        return {
+            "status": "error",
+            "message": f"Unsupported file extension: {requested_path.suffix}. Allowed: .har, .zhar, .json",
+        }
+    try:
+        requested_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to create parent directory: {str(e)}"}
+
+    should_compress = bool(compress) or str(requested_path).lower().endswith(".zhar")
+
+    try:
+        db = controller.recorder.db
+
+        # Detect optional raw columns for fidelity (parallel migration)
+        has_raw = False
+        try:
+            with db._get_conn() as conn:
+                cursor = conn.execute("PRAGMA table_info(flows)")
+                cols = [r[1] for r in cursor.fetchall()]
+                if "request_raw" in cols and "response_raw" in cols:
+                    has_raw = True
+                elif "request_raw" in cols or "response_raw" in cols:
+                    has_raw = True
+        except Exception:
+            has_raw = False
+
+        # Build SELECT
+        select_cols = "id, url, method, status_code, request_headers, request_body, response_headers, response_body, timestamp"
+        if has_raw:
+            # Check which raw cols actually exist to avoid SELECT errors
+            try:
+                with db._get_conn() as conn:
+                    cursor = conn.execute("PRAGMA table_info(flows)")
+                    existing = {r[1] for r in cursor.fetchall()}
+                    raw_to_add = []
+                    if "request_raw" in existing:
+                        raw_to_add.append("request_raw")
+                    if "response_raw" in existing:
+                        raw_to_add.append("response_raw")
+                    if raw_to_add:
+                        select_cols += ", " + ", ".join(raw_to_add)
+                    else:
+                        has_raw = False
+            except Exception:
+                has_raw = False
+
+        sql = f"SELECT {select_cols} FROM flows"
+        params: List[Any] = []
+        clauses: List[str] = []
+
+        ids: Optional[List[str]] = None
+        if flow_ids is not None:
+            # csv → get_by_ids semantics
+            ids = [fid.strip() for fid in flow_ids.split(",") if fid.strip()]
+            if ids:
+                placeholders = ",".join(["?"] * len(ids))
+                clauses.append(f"id IN ({placeholders})")
+                params.extend(ids)
+            else:
+                # No valid ids -> return empty HAR
+                sql += " WHERE 1=0"
+                clauses = []  # avoid double WHERE
+                params = []
+                # Skip further clauses, go directly to fetch
+                with db._get_conn() as conn:
+                    conn.row_factory = sqlite3.Row
+                    cursor = conn.execute(sql, params)
+                    rows = cursor.fetchall()
+                # Proceed to HAR generation with empty rows
+                rows_for_empty = rows
+                # Generate empty HAR
+                from mitmproxy.addons.savehar import SaveHar
+
+                s = SaveHar()
+                har_empty = s.make_har([])
+                data_empty = json.dumps(har_empty, indent=2).encode()
+                if should_compress:
+                    data_empty = zlib.compress(data_empty, 9)
+
+                def _write_empty():
+                    with open(requested_path, "wb") as f:
+                        f.write(data_empty)
+
+                await asyncio.to_thread(_write_empty)
+                return {
+                    "status": "ok",
+                    "path": str(requested_path),
+                    "entries": 0,
+                    "bytes": len(data_empty),
+                    "filter": {"domain": domain, "limit": limit},
+                }
+
+        if domain:
+            clauses.append("url LIKE ?")
+            params.append(f"%{domain}%")
+
+        if clauses:
+            # If we already handled empty ids case, clauses may be non-empty but sql already has WHERE from that branch.
+            # For normal path, add WHERE
+            if "WHERE 1=0" not in sql:
+                sql += " WHERE " + " AND ".join(clauses)
+
+        sql += " ORDER BY timestamp DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+
+        # Fetch rows
+        with db._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            try:
+                cursor = conn.execute(sql, params)
+                rows = cursor.fetchall()
+            except sqlite3.OperationalError as e:
+                # Fallback if raw columns missing (should not happen after PRAGMA check, but tolerate)
+                if "request_raw" in str(e) or "response_raw" in str(e):
+                    # Retry without raw columns
+                    select_cols_fallback = "id, url, method, status_code, request_headers, request_body, response_headers, response_body, timestamp"
+                    sql_fallback = sql.replace(select_cols, select_cols_fallback)
+                    cursor = conn.execute(sql_fallback, params)
+                    rows = cursor.fetchall()
+                    has_raw = False
+                else:
+                    raise
+
+        # Reconstruct flows for SaveHar
+        flows: List[Any] = []
+        # Import here to avoid circular
+        from mitmproxy import connection as mitm_connection
+        from mitmproxy import http as mitm_http
+
+        # Use recorder helper if available, else local fallback
+        try:
+            from .recorder import _parse_headers_ordered as parse_ordered  # type: ignore
+        except Exception:
+            def parse_ordered(raw: str):  # type: ignore
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return parsed
+                return [[k, v] for k, v in parsed.items()]
+
+        for row in rows:
+            try:
+                url = row["url"] or ""
+                method = row["method"] or "GET"
+                timestamp = row["timestamp"] if row["timestamp"] is not None else time.time()
+
+                # Request headers
+                raw_req_headers = row["request_headers"]
+                ordered_req: List[List[str]] = []
+                if raw_req_headers:
+                    try:
+                        ordered_req = parse_ordered(raw_req_headers)
+                    except Exception:
+                        try:
+                            parsed = json.loads(raw_req_headers)
+                            if isinstance(parsed, list):
+                                ordered_req = parsed
+                            else:
+                                ordered_req = [[k, v] for k, v in parsed.items()]
+                        except Exception:
+                            ordered_req = []
+                try:
+                    req_headers = mitm_http.Headers(
+                        [[k.encode("latin-1"), v.encode("latin-1")] for k, v in ordered_req]
+                    )
+                except Exception:
+                    req_headers = mitm_http.Headers()
+
+                # Request content
+                req_content: bytes = b""
+                # Prefer raw base64 if available
+                raw_val = None
+                try:
+                    raw_val = row["request_raw"] if has_raw and "request_raw" in row.keys() else None
+                except Exception:
+                    raw_val = None
+                if raw_val is not None:
+                    try:
+                        req_content = base64.b64decode(raw_val)
+                    except Exception:
+                        body_text = row["request_body"]
+                        req_content = body_text.encode("utf-8", "surrogateescape") if body_text else b""
+                else:
+                    body_text = row["request_body"]
+                    req_content = body_text.encode("utf-8", "surrogateescape") if body_text else b""
+
+                request = mitm_http.Request.make(method, url, content=req_content, headers=req_headers)
+                request.timestamp_start = timestamp
+                request.timestamp_end = timestamp
+                request.http_version = "HTTP/1.1"
+
+                # Response
+                response = None
+                status_code = row["status_code"]
+                if status_code is not None:
+                    raw_resp_headers = row["response_headers"]
+                    ordered_resp: List[List[str]] = []
+                    if raw_resp_headers:
+                        try:
+                            ordered_resp = parse_ordered(raw_resp_headers)
+                        except Exception:
+                            try:
+                                parsed = json.loads(raw_resp_headers)
+                                if isinstance(parsed, list):
+                                    ordered_resp = parsed
+                                else:
+                                    ordered_resp = [[k, v] for k, v in parsed.items()]
+                            except Exception:
+                                ordered_resp = []
+                    try:
+                        resp_headers = mitm_http.Headers(
+                            [[k.encode("latin-1"), v.encode("latin-1")] for k, v in ordered_resp]
+                        )
+                    except Exception:
+                        resp_headers = mitm_http.Headers()
+
+                    resp_content: bytes = b""
+                    raw_resp_val = None
+                    try:
+                        raw_resp_val = row["response_raw"] if has_raw and "response_raw" in row.keys() else None
+                    except Exception:
+                        raw_resp_val = None
+                    if raw_resp_val is not None:
+                        try:
+                            resp_content = base64.b64decode(raw_resp_val)
+                        except Exception:
+                            body_text = row["response_body"]
+                            resp_content = body_text.encode("utf-8", "surrogateescape") if body_text else b""
+                    else:
+                        body_text = row["response_body"]
+                        resp_content = body_text.encode("utf-8", "surrogateescape") if body_text else b""
+
+                    try:
+                        response = mitm_http.Response.make(int(status_code), content=resp_content, headers=resp_headers)
+                    except Exception:
+                        response = mitm_http.Response.make(int(status_code), content=resp_content, headers=resp_headers)
+                    response.timestamp_start = timestamp
+                    response.timestamp_end = timestamp
+                    response.http_version = "HTTP/1.1"
+
+                # Build flow with dummy connections
+                parsed_url = urlparse(url)
+                host = parsed_url.hostname or "example.com"
+                try:
+                    port = parsed_url.port or (443 if parsed_url.scheme == "https" else 80)
+                except Exception:
+                    port = 80
+
+                client_conn = mitm_connection.Client(
+                    peername=("127.0.0.1", 0),
+                    sockname=("127.0.0.1", 0),
+                    timestamp_start=timestamp,
+                )
+                server_conn = mitm_connection.Server(address=(host, port))
+                flow = mitm_http.HTTPFlow(client_conn, server_conn, live=False)
+                flow.request = request
+                if response is not None:
+                    flow.response = response
+                # Preserve original ID for traceability
+                try:
+                    flow.id = row["id"]
+                except Exception:
+                    pass
+                flows.append(flow)
+            except Exception as e:
+                # Skip problematic flow but log
+                print(f"Skipping flow during HAR export: {e}", file=sys.stderr)
+                continue
+
+        from mitmproxy.addons.savehar import SaveHar
+
+        s = SaveHar()
+        har = s.make_har(flows)
+        data = json.dumps(har, indent=2).encode()
+        if should_compress:
+            data = zlib.compress(data, 9)
+
+        def _write():
+            with open(requested_path, "wb") as f:
+                f.write(data)
+
+        await asyncio.to_thread(_write)
+
+        return {
+            "status": "ok",
+            "path": str(requested_path),
+            "entries": len(har["log"]["entries"]),
+            "bytes": len(data),
+            "filter": {"domain": domain, "limit": limit},
+        }
+    except Exception as e:
+        logger.error("export_har_failed", error=str(e))
         return {"status": "error", "message": str(e)}
 
 

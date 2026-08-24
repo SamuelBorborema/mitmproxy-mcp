@@ -493,33 +493,68 @@ class TrafficDB:
             print(f"File not found: {file_path}", file=sys.stderr)
             return stats
 
-        allowed_exts = ('.har', '.mitm', '.flow')
+        allowed_exts = ('.har', '.mitm', '.flow', '.json', '.zhar')
         if not any(str(file_path).lower().endswith(ext) for ext in allowed_exts):
             print(f"Unsupported file extension: {file_path}", file=sys.stderr)
             return stats
 
-        with open(file_path, "rb") as f:
-            reader = FlowReader(f)
+        # Handle .zhar (zlib-compressed HAR) and also .har/.json that may be compressed via compress flag
+        lower_path = str(file_path).lower()
+        use_zlib = lower_path.endswith('.zhar')
+        file_obj = None
+        raw_bytes = None
+        if use_zlib or lower_path.endswith(('.har', '.json')):
+            try:
+                with open(file_path, "rb") as check_f:
+                    raw_bytes = check_f.read()
+                if use_zlib:
+                    import zlib
+                    try:
+                        decompressed = zlib.decompress(raw_bytes)
+                        stripped = decompressed.lstrip()
+                        if stripped.startswith(b"{") or stripped.startswith(b"["):
+                            raw_bytes = decompressed
+                    except Exception:
+                        pass
+                else:
+                    if raw_bytes[:2] in (b"\x78\x01", b"\x78\x9c", b"\x78\xda"):
+                        import zlib
+                        try:
+                            decompressed = zlib.decompress(raw_bytes)
+                            stripped = decompressed.lstrip()
+                            if stripped.startswith(b"{") or stripped.startswith(b"["):
+                                raw_bytes = decompressed
+                        except Exception:
+                            pass
+                import io
+                file_obj = io.BytesIO(raw_bytes)
+            except Exception:
+                file_obj = None
+
+        def _process_stream(reader):
             for flow in reader.stream():
                 try:
                     if not isinstance(flow, http.HTTPFlow):
                         stats["skipped"] += 1
                         continue
-
                     if scope:
                         host = urlparse(flow.request.url).hostname or ""
                         if not any(host == d or host.endswith("." + d) for d in scope):
                             stats["skipped"] += 1
                             continue
-
                     self.save_flow(flow)
                     stats["imported"] += 1
                 except Exception as e:
                     stats["errors"] += 1
-                    print(
-                        f"Skipped flow during import: {e}",
-                        file=sys.stderr,
-                    )
+                    print(f"Skipped flow during import: {e}", file=sys.stderr)
+
+        if file_obj is not None:
+            reader = FlowReader(file_obj)
+            _process_stream(reader)
+        else:
+            with open(file_path, "rb") as f:
+                reader = FlowReader(f)
+                _process_stream(reader)
 
         return stats
 
