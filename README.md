@@ -35,17 +35,22 @@ Standard "web search" or "fetch" tools are stateless and easily detected. mitmpr
 - **Security Recon Helpers**: Detect common auth patterns and run targeted fuzz payloads.
 - **Scraper Bootstrapping**: Generate executable `curl-cffi` automation code from observed traffic.
 
+> **Why this fork?** The upstream PyPI release (`mitmproxy-mcp` 0.6.x) crashes with
+> `mcp >= 2` because it imports `mcp.server.fastmcp`, a module removed in mcp 2.x.
+> This fork is migrated to the mcp 2.x `MCPServer` API and requires **Python >= 3.13**.
+> Install from this repository — the upstream package will not start on modern `mcp`.
+
 ## Quickstart
 
-### Option 1: Using `uvx` (Recommended)
-Add this to your MCP client configuration (e.g., Claude Desktop, Cursor, or AntiGravity):
+### Option 1: Using `uvx` from this repository (Recommended)
+Add this to your MCP client configuration (e.g., Claude Desktop, Cursor, opencode, or AntiGravity):
 
 ```json
 {
   "mcpServers": {
     "mitmproxy-mcp": {
       "command": "uvx",
-      "args": ["mitmproxy-mcp"]
+      "args": ["--from", "git+https://github.com/SamuelBorborema/mitmproxy-mcp", "mitmproxy-mcp"]
     }
   }
 }
@@ -56,7 +61,7 @@ Add this to your MCP client configuration (e.g., Claude Desktop, Cursor, or Anti
 If you want to run from a local clone (useful for development or testing unreleased changes):
 
 ```bash
-git clone https://github.com/snapspecter/mitmproxy-mcp.git
+git clone https://github.com/SamuelBorborema/mitmproxy-mcp.git
 ```
 
 Then add this to your MCP client configuration, replacing the path with your clone location:
@@ -78,8 +83,7 @@ Then add this to your MCP client configuration, replacing the path with your clo
 ### Option 1: Global Install (with `uv`)
 
 ```bash
-uv tool install mitmproxy-mcp
-
+uv tool install git+https://github.com/SamuelBorborema/mitmproxy-mcp
 ```
 
 ### Option 2: Docker (Isolated Environment)
@@ -88,7 +92,6 @@ uv tool install mitmproxy-mcp
 # Build and run
 docker build -t mitmproxy-mcp .
 docker run -p 8080:8080 mitmproxy-mcp
-
 ```
 
 ### Option 3: Manual Pip Install
@@ -96,8 +99,7 @@ docker run -p 8080:8080 mitmproxy-mcp
 ```bash
 python -m venv venv
 source venv/bin/activate
-pip install mitmproxy-mcp
-
+pip install git+https://github.com/SamuelBorborema/mitmproxy-mcp
 ```
 
 ## Available Tools
@@ -167,14 +169,11 @@ Note: These are JSON-RPC calls sent by the MCP Host (Client). You do not need to
 ## Development
 
 ```bash
-git clone [https://github.com/snapspecter/mitmproxy-mcp.git](https://github.com/snapspecter/mitmproxy-mcp.git)
+git clone https://github.com/SamuelBorborema/mitmproxy-mcp.git
 cd mitmproxy-mcp
 uv sync
 uv run pytest
-
 ```
 
 **License:** MIT
 
-
-```
