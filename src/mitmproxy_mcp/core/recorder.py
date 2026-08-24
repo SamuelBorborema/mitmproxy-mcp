@@ -339,6 +339,54 @@ class TrafficDB:
         with self._get_conn() as conn:
             conn.execute("DELETE FROM flows")
 
+    def _has_duration_column(self) -> bool:
+        """Check if flows table has a duration column (added by parallel branch)."""
+        try:
+            with self._get_conn() as conn:
+                cur = conn.execute("PRAGMA table_info(flows)")
+                cols = [r[1] for r in cur.fetchall()]
+                return "duration" in cols
+        except Exception:
+            return False
+
+    def get_cluster_stats(
+        self, values: List[float], sensitivity: float = 1.5
+    ) -> Dict[str, Any]:
+        """Compute per-cluster IQR stats (pure python, no numpy).
+
+        Returns dict with q1, q3, median, iqr, lower, upper.
+        Uses sorted quartiles and IQR*sensitivity bounds.
+        """
+        if not values:
+            return {"q1": 0, "q3": 0, "median": 0, "iqr": 0, "lower": 0, "upper": 0}
+        s = sorted(values)
+        n = len(s)
+
+        def _percentile(p: float) -> float:
+            # p in [0,100]
+            if n == 1:
+                return float(s[0])
+            k = (n - 1) * p / 100.0
+            f = int(k // 1)
+            c = int(k // 1) if k % 1 == 0 else f + 1
+            if f == c:
+                return float(s[int(k)])
+            d0 = k - f
+            # guard bounds
+            if c >= n:
+                c = n - 1
+            if f >= n:
+                f = n - 1
+            return float(s[f]) * (1 - d0) + float(s[c]) * d0
+
+        q1 = _percentile(25)
+        q3 = _percentile(75)
+        median = _percentile(50)
+        iqr = q3 - q1
+        lower = q1 - sensitivity * iqr
+        upper = q3 + sensitivity * iqr
+        return {"q1": q1, "q3": q3, "median": median, "iqr": iqr, "lower": lower, "upper": upper}
+
     def get_all_for_analysis(
         self, limit: Optional[int] = None, lightweight: bool = False
     ) -> List[Dict[str, Any]]:
@@ -348,9 +396,16 @@ class TrafficDB:
             limit: Max flows to return. None = all flows.
             lightweight: If True, only select columns needed for clustering
                 (no bodies). Reduces memory usage for large captures.
+                For large DB, use lightweight first then second-pass fetch
+                anomalous bodies only.
         """
+        has_duration = self._has_duration_column()
         if lightweight:
-            cols = "id, url, method, status_code, request_headers, response_headers"
+            cols = "id, url, method, status_code, request_headers, response_headers, timestamp, size"
+            if has_duration:
+                cols += ", duration"
+            # Lightweight omits bodies to save memory; second-pass fetches bodies for anomalies
+            # Keep request_body/response_body out for lightweight
         else:
             cols = "*"
 
@@ -362,10 +417,50 @@ class TrafficDB:
 
         with self._get_conn() as conn:
             conn.row_factory = sqlite3.Row
-            cursor = conn.execute(sql, params)
+            try:
+                cursor = conn.execute(sql, params)
+            except sqlite3.OperationalError as e:
+                # Fallback if duration column missing but was selected (race)
+                if "duration" in str(e) and lightweight and has_duration:
+                    cols = "id, url, method, status_code, request_headers, response_headers, timestamp, size"
+                    sql = f"SELECT {cols} FROM flows ORDER BY timestamp DESC"
+                    if limit is not None:
+                        sql += " LIMIT ?"
+                    cursor = conn.execute(sql, params)
+                else:
+                    raise
             rows = cursor.fetchall()
             results = []
             for row in rows:
+                # Safely extract optional columns
+                try:
+                    size_val = row["size"] if "size" in row.keys() else 0
+                except Exception:
+                    size_val = 0
+                try:
+                    ts_val = row["timestamp"] if "timestamp" in row.keys() else None
+                except Exception:
+                    ts_val = None
+                # duration tolerant
+                duration_val = None
+                try:
+                    if has_duration and "duration" in row.keys():
+                        duration_val = row["duration"]
+                except Exception:
+                    duration_val = None
+                # request body handling
+                req_body = None
+                try:
+                    if not lightweight and "request_body" in row.keys():
+                        req_body = row["request_body"]
+                except Exception:
+                    req_body = None
+                resp_body = None
+                try:
+                    if not lightweight and "response_body" in row.keys():
+                        resp_body = row["response_body"]
+                except Exception:
+                    resp_body = None
                 results.append(
                     {
                         "id": row["id"],
@@ -374,7 +469,7 @@ class TrafficDB:
                             "method": row["method"],
                             "headers": _parse_headers(row["request_headers"]),
                             **(
-                                {"body": row["request_body"]}
+                                {"body": req_body}
                                 if not lightweight
                                 else {}
                             ),
@@ -385,13 +480,16 @@ class TrafficDB:
                             if row["response_headers"]
                             else {},
                             **(
-                                {"body": row["response_body"]}
+                                {"body": resp_body}
                                 if not lightweight
                                 else {}
                             ),
                         }
-                        if row["status_code"]
+                        if row["status_code"] is not None
                         else None,
+                        "size": size_val if size_val is not None else 0,
+                        "timestamp": ts_val,
+                        "duration": duration_val,
                     }
                 )
             return results
@@ -462,11 +560,13 @@ class TrafficDB:
                         resp["body"] = row["response_body"]
                     entry["response"] = resp
 
-                # include timestamp / size when present – needed for diff_flows
+                # include timestamp / size / duration when present – needed for diff_flows & anomaly detection
                 if "timestamp" in row_keys:
                     entry["timestamp"] = row["timestamp"]
                 if "size" in row_keys:
                     entry["size"] = row["size"]
+                if "duration" in row_keys:
+                    entry["duration"] = row["duration"]
 
                 results.append(entry)
             return results
