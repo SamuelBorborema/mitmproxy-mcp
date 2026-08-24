@@ -17,7 +17,8 @@ async def test_path_traversal_denied():
         # Attempt to access it via relative traversal
         # We know we are in /home/snap/Development/mitmproxy-mcp/tests or similar
         result_str = await load_traffic_file("../../../../../tmp/mitm_traversal_test.har")
-        result = json.loads(result_str)
+        # Structured output: result is already a dict
+        result = result_str if isinstance(result_str, dict) else json.loads(result_str)
         
         assert result["status"] == "error"
         assert "Security Error" in result["message"]
@@ -38,7 +39,7 @@ async def test_valid_path_allowed(tmp_path):
         
     try:
         result_str = await load_traffic_file("test_safe_import.har")
-        result = json.loads(result_str)
+        result = result_str if isinstance(result_str, dict) else json.loads(result_str)
         
         # Should NOT be a security error
         assert result["status"] == "ok"
