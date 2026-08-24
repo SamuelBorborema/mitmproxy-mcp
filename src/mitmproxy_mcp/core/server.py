@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import os
 import sys
@@ -59,6 +60,9 @@ class MitmController:
         self.session_variables = {}
         self.dump_file = dump_file
         self.cli_upstream_proxy: Optional[str] = None
+        self.default_port = 8080
+        self.default_host = "127.0.0.1"
+        self.auto_start = False
 
     def _get_verify_param(self, verify_override: Optional[bool] = None) -> Any:
         if verify_override is not None:
@@ -240,26 +244,45 @@ class MitmController:
 # Global Controller Instance
 controller = MitmController()
 
-mcp = MCPServer(name="Mitmproxy Manager")
+
+@contextlib.asynccontextmanager
+async def _lifespan(_server):
+    if getattr(controller, "auto_start", False) and not controller.running:
+        result = await controller.start(port=controller.default_port, host=controller.default_host)
+        logger.info("auto_start", result=result)
+    try:
+        yield
+    finally:
+        if controller.running:
+            await controller.stop()
+
+
+mcp = MCPServer(name="Mitmproxy Manager", lifespan=_lifespan)
 
 # --- MCP Tools ---
 
 
 @mcp.tool()
 async def start_proxy(
-    port: int = 8080, dump_file: Optional[str] = None, upstream_proxy: Optional[str] = None
+    port: Optional[int] = None,
+    dump_file: Optional[str] = None,
+    upstream_proxy: Optional[str] = None,
 ) -> str:
     """
     Start the mitmproxy instance.
     Args:
-        port: Port to listen on (default 8080)
+        port: Port to listen on. Omit to use the server's configured default
+            (--port / MITMPROXY_PORT, else 8080).
         dump_file: Optional file path to save raw mitmproxy .flow data.
             Prefix with + to append to an existing file.
         upstream_proxy: Optional upstream proxy URL (e.g., 'http://user:pass@proxy:port').
     """
     try:
         return await controller.start(
-            port=port, dump_file=dump_file, upstream_proxy=upstream_proxy
+            port=port if port is not None else controller.default_port,
+            host=controller.default_host,
+            dump_file=dump_file,
+            upstream_proxy=upstream_proxy,
         )
     except Exception as e:
         logger.error("proxy_start_failed", error=str(e))
@@ -1261,6 +1284,14 @@ async def generate_scraper_code(flow_ids: str, target_framework: str = "curl_cff
     return render_scraper_code(target_framework, normalized_flows)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Parse a boolean env var (1/true/yes/on are truthy, case-insensitive)."""
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
 def start():
     """Entry point for running the server directly."""
     import argparse
@@ -1278,12 +1309,36 @@ def start():
         help="Upstream proxy URL (e.g., http://user:pass@proxy:port). "
         "Can also be set via MITMPROXY_UPSTREAM_PROXY env var.",
     )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("MITMPROXY_PORT", "8080")),
+        help="Default proxy listen port used by start_proxy and --auto-start "
+        "(default 8080). Can also be set via MITMPROXY_PORT env var.",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("MITMPROXY_HOST", "127.0.0.1"),
+        help="Default proxy listen host (default 127.0.0.1). "
+        "Can also be set via MITMPROXY_HOST env var.",
+    )
+    parser.add_argument(
+        "--auto-start",
+        action="store_true",
+        default=_env_flag("MITMPROXY_AUTO_START"),
+        help="Start the proxy immediately on server startup instead of waiting "
+        "for the start_proxy tool. Can also be set via MITMPROXY_AUTO_START env var.",
+    )
     args, _ = parser.parse_known_args()
 
     global controller
-    # Store CLI upstream proxy if provided
     controller = MitmController(dump_file=args.dump_file)
     controller.cli_upstream_proxy = args.upstream_proxy
+    # start_proxy() and --auto-start fall back to these when no port is passed,
+    # so a wrapper can pin a per-agent port that the browser also targets.
+    controller.default_port = args.port
+    controller.default_host = args.host
+    controller.auto_start = args.auto_start
 
     mcp.run()
 
