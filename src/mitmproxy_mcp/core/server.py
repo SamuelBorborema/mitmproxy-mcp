@@ -12,7 +12,7 @@ import re2
 
 import structlog
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mitmproxy import options
 from mitmproxy.tools.dump import DumpMaster
 from curl_cffi.requests import AsyncSession
@@ -225,7 +225,7 @@ class MitmController:
 # Global Controller Instance
 controller = MitmController()
 
-mcp = FastMCP("Mitmproxy Manager")
+mcp = MCPServer(name="Mitmproxy Manager")
 
 # --- MCP Tools ---
 
@@ -885,7 +885,7 @@ async def list_tools() -> str:
     tool_list = []
     for tool in tools:
         tool_list.append(
-            {"name": tool.name, "description": tool.description, "input_schema": tool.inputSchema}
+            {"name": tool.name, "description": tool.description, "input_schema": tool.input_schema}
         )
     return json.dumps(tool_list, indent=2)
 
