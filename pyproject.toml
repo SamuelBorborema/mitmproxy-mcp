@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mitmproxy-mcp"
-version = "0.6.1"
+version = "0.6.2"
 description = "MITM proxy manager with MCP integration"
 readme = "README.md"
-requires-python = ">=3.12,<3.14"
+requires-python = ">=3.13"
 license = {text = "MIT"}
 authors = [{ name = "SnapSpecter", email = "snapspecter@outlook.com" }]
 keywords = ["mitmproxy", "mcp", "proxy", "http", "debugging", "api"]
@@ -16,13 +16,13 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
     "mitmproxy>=12.0.0",
     "curl-cffi>=0.14.0",
-    "mcp>=1.25.0",
+    "mcp>=2.1.0",
     "httpx>=0.28.0",
     "httpx-sse>=0.4.0",
     "uvicorn>=0.40.0",
