@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import json
+import time
 from pathlib import Path
 from collections import Counter
 from typing import List, Dict, Any, Optional, Tuple
@@ -14,6 +15,7 @@ import re2
 import structlog
 
 from mcp.server.mcpserver import MCPServer
+from mcp.types import ToolAnnotations
 from mitmproxy import options
 from mitmproxy.tools.dump import DumpMaster
 from curl_cffi.requests import AsyncSession
@@ -57,12 +59,14 @@ class MitmController:
         self.interceptor = TrafficInterceptor()
         self.running = False
         self.port = 8080
+        self.host = "127.0.0.1"
         self.session_variables = {}
         self.dump_file = dump_file
         self.cli_upstream_proxy: Optional[str] = None
         self.default_port = 8080
         self.default_host = "127.0.0.1"
         self.auto_start = False
+        self.started_at: Optional[float] = None
 
     def _get_verify_param(self, verify_override: Optional[bool] = None) -> Any:
         if verify_override is not None:
@@ -85,6 +89,7 @@ class MitmController:
             return "MITM is already running."
 
         self.port = port
+        self.host = host
         opts = options.Options(listen_host=host, listen_port=port)
 
         up_proxy = upstream_proxy or self.cli_upstream_proxy
@@ -122,6 +127,7 @@ class MitmController:
 
         self.proxy_task = asyncio.create_task(self.master.run())
         self.running = True
+        self.started_at = time.monotonic()
         logger.info("proxy_started", host=host, port=port)
         msg = f"Started proxy on port {port}"
         if save_path:
@@ -159,6 +165,7 @@ class MitmController:
                     pass
             self.proxy_task = None
         self.running = False
+        self.started_at = None
         logger.info("proxy_stopped")
         return "Stopped the proxy."
 
@@ -914,6 +921,56 @@ async def list_rules() -> str:
 async def clear_rules() -> str:
     controller.interceptor.clear_rules()
     return "Cleared all interception rules."
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def proxy_status() -> dict:
+    """Return current proxy/server status."""
+    # uptime calculation is monotonic and cheap
+    uptime_seconds: Optional[float] = None
+    if controller.running and controller.started_at is not None:
+        try:
+            uptime_seconds = time.monotonic() - controller.started_at
+        except Exception:
+            uptime_seconds = None
+
+    # flow_count via direct COUNT(*) — cheap, no full scan of bodies
+    try:
+        with controller.recorder.db._get_conn() as conn:
+            cursor = conn.execute("SELECT COUNT(*) FROM flows")
+            row = cursor.fetchone()
+            flow_count = int(row[0]) if row else 0
+    except Exception:
+        flow_count = 0
+
+    db_path = getattr(controller.recorder.db, "db_path", "mitm_mcp_traffic.db")
+    try:
+        if os.path.exists(db_path):
+            db_size_bytes = os.path.getsize(db_path)
+        else:
+            db_size_bytes = 0
+    except Exception:
+        db_size_bytes = None
+
+    # host/port: current values (host tracked on start, port updated on start)
+    host = getattr(controller, "host", controller.default_host)
+    port = getattr(controller, "port", controller.default_port)
+
+    return {
+        "running": bool(controller.running),
+        "host": host,
+        "port": port,
+        "uptime_seconds": uptime_seconds,
+        "flow_count": flow_count,
+        "db_path": str(db_path),
+        "db_size_bytes": db_size_bytes,
+        "active_rules_count": len(controller.interceptor.rules),
+        "scope_domains": list(controller.scope_config.allowed_domains),
+        "upstream_proxy": controller.cli_upstream_proxy,
+        "auto_start": bool(controller.auto_start),
+        "default_host": controller.default_host,
+        "default_port": controller.default_port,
+    }
 
 
 @mcp.tool()

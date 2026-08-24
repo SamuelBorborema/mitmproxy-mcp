@@ -108,6 +108,7 @@ pip install git+https://github.com/SamuelBorborema/mitmproxy-mcp
 
 * `start_proxy(port=8080)`: Starts the mitmproxy server.
 * `stop_proxy()`: Shuts down the proxy.
+* `proxy_status()`: Returns current proxy/server status (running, host/port, uptime, flow count, DB path/size, rules, scope, upstream proxy, defaults). Read-only.
 * `set_scope(allowed_domains)`: Filters recorded traffic (e.g., `["api.github.com", "example.com"]`).
 * `list_tools()`: Returns all exposed MCP tools and input schemas.
 
