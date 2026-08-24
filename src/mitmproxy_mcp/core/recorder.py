@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 import os
 import shlex
@@ -83,12 +85,42 @@ class TrafficDB:
                     response_headers TEXT,
                     response_body TEXT,
                     timestamp REAL,
-                    size INTEGER
+                    size INTEGER,
+                    duration REAL DEFAULT 0,
+                    request_raw TEXT,
+                    response_raw TEXT,
+                    request_hash TEXT,
+                    response_hash TEXT
                 )
             """)
+            # Handle existing DB: try ALTER, ignore if column already exists
+            # Also check PRAGMA table_info as fallback for strict checking
+            try:
+                cursor = conn.execute("PRAGMA table_info(flows)")
+                existing_cols = {row[1] for row in cursor.fetchall()}
+            except Exception:
+                existing_cols = set()
+
+            alter_stmts = [
+                ("duration", "ALTER TABLE flows ADD COLUMN duration REAL DEFAULT 0"),
+                ("request_raw", "ALTER TABLE flows ADD COLUMN request_raw TEXT"),
+                ("response_raw", "ALTER TABLE flows ADD COLUMN response_raw TEXT"),
+                ("request_hash", "ALTER TABLE flows ADD COLUMN request_hash TEXT"),
+                ("response_hash", "ALTER TABLE flows ADD COLUMN response_hash TEXT"),
+            ]
+            for col, stmt in alter_stmts:
+                if col not in existing_cols:
+                    try:
+                        conn.execute(stmt)
+                    except sqlite3.OperationalError as e:
+                        if "duplicate column name" in str(e).lower() or "already exists" in str(e).lower():
+                            continue
+                        raise
             conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON flows(timestamp)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_url ON flows(url)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_method ON flows(method)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON flows(status_code)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_size ON flows(size)")
 
     def save_flow(self, flow: http.HTTPFlow):
         """Upserts a flow into the database."""
@@ -98,6 +130,39 @@ class TrafficDB:
         status_code = flow.response.status_code if flow.response else None
         size = len(flow.response.content) if flow.response and flow.response.content else 0
 
+        # duration
+        duration = 0
+        try:
+            if flow.response and flow.response.timestamp_end and flow.request.timestamp_start:
+                duration = flow.response.timestamp_end - flow.request.timestamp_start
+        except Exception:
+            duration = 0
+
+        # raw bytes handling: prefer raw_content, fallback to content
+        def _get_raw_bytes(msg):
+            if msg is None:
+                return None
+            raw = getattr(msg, "raw_content", None)
+            if raw is not None:
+                return raw
+            # fallback to content (already decompressed)
+            try:
+                c = msg.content
+                if c is not None:
+                    return c
+            except Exception:
+                pass
+            return None
+
+        req_raw_bytes = _get_raw_bytes(flow.request)
+        resp_raw_bytes = _get_raw_bytes(flow.response) if flow.response else None
+
+        req_raw_b64 = base64.b64encode(req_raw_bytes).decode() if req_raw_bytes is not None else None
+        resp_raw_b64 = base64.b64encode(resp_raw_bytes).decode() if resp_raw_bytes is not None else None
+
+        req_hash = hashlib.sha256(req_raw_bytes).hexdigest() if req_raw_bytes is not None else None
+        resp_hash = hashlib.sha256(resp_raw_bytes).hexdigest() if resp_raw_bytes is not None else None
+
         with self._get_conn() as conn:
             conn.execute(
                 """
@@ -105,8 +170,10 @@ class TrafficDB:
                     id, url, method, status_code,
                     request_headers, request_body,
                     response_headers, response_body,
-                    timestamp, size
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    timestamp, size,
+                    duration, request_raw, response_raw,
+                    request_hash, response_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     url=excluded.url,
                     method=excluded.method,
@@ -115,7 +182,12 @@ class TrafficDB:
                     request_body=excluded.request_body,
                     response_headers=excluded.response_headers,
                     response_body=excluded.response_body,
-                    size=excluded.size
+                    size=excluded.size,
+                    duration=excluded.duration,
+                    request_raw=excluded.request_raw,
+                    response_raw=excluded.response_raw,
+                    request_hash=excluded.request_hash,
+                    response_hash=excluded.response_hash
             """,
                 (
                     flow.id,
@@ -140,6 +212,11 @@ class TrafficDB:
                     resp_body,
                     flow.request.timestamp_start,
                     size,
+                    duration,
+                    req_raw_b64,
+                    resp_raw_b64,
+                    req_hash,
+                    resp_hash,
                 ),
             )
 
@@ -340,7 +417,8 @@ class TrafficDB:
         if columns:
             allowed_cols = {
                 "id", "url", "method", "status_code", "request_headers", 
-                "request_body", "response_headers", "response_body", "timestamp", "size"
+                "request_body", "response_headers", "response_body", "timestamp", "size",
+                "duration", "request_raw", "response_raw", "request_hash", "response_hash"
             }
             invalid_cols = [c for c in columns if c not in allowed_cols]
             if invalid_cols:
