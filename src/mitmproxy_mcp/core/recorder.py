@@ -462,8 +462,25 @@ class TrafficDB:
                         resp["body"] = row["response_body"]
                     entry["response"] = resp
 
+                # include timestamp / size when present – needed for diff_flows
+                if "timestamp" in row_keys:
+                    entry["timestamp"] = row["timestamp"]
+                if "size" in row_keys:
+                    entry["size"] = row["size"]
+
                 results.append(entry)
             return results
+
+    def get_full_flow(self, flow_id: str, ordered_headers: bool = False) -> Optional[Dict[str, Any]]:
+        """Return full flow dict with request+response bodies and metadata.
+
+        Fetches all columns for a single id via get_by_ids pattern and
+        normalises header ordering when requested. Returns None if not found.
+        """
+        results = self.get_by_ids([flow_id], ordered_headers=ordered_headers)
+        if not results:
+            return None
+        return results[0]
 
     def import_from_file(
         self,
@@ -580,7 +597,7 @@ class TrafficDB:
         with self._get_conn() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
-                "SELECT method, url, request_headers, request_body FROM flows WHERE id = ?",
+                "SELECT method, url, request_headers, request_body, response_headers, response_body, status_code FROM flows WHERE id = ?",
                 (flow_id,),
             )
             row = cursor.fetchone()
@@ -589,12 +606,28 @@ class TrafficDB:
                 return None
 
             headers = _parse_headers(row["request_headers"])
-            return SimpleRequest(
+            obj = SimpleRequest(
                 method=row["method"],
                 url=row["url"],
                 headers=headers,
                 body=row["request_body"],
             )
+            # Attach response info for callers that need it (e.g. diff_flows, get_flow_schema)
+            # Keep backward compat: .body/.headers/.method remain for request.
+            # Response is available as .response if row has it.
+            if row["status_code"] is not None:
+                resp_headers = _parse_headers(row["response_headers"]) if row["response_headers"] else None
+                obj.response = SimpleResponse(  # type: ignore[attr-defined]
+                    status_code=row["status_code"],
+                    headers=resp_headers,
+                    body=row["response_body"],
+                )
+            else:
+                obj.response = None  # type: ignore[attr-defined]
+            # Also expose full flow dict for convenience
+            obj.request_body = row["request_body"]  # type: ignore[attr-defined]
+            obj.response_body = row["response_body"]  # type: ignore[attr-defined]
+            return obj
 
 
 class TrafficRecorder:
@@ -680,10 +713,73 @@ class TrafficRecorder:
     ) -> List[Dict[str, Any]]:
         return self.db.get_all_for_analysis(limit, lightweight=lightweight)
 
+    def _enrich_with_live_flow(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        """Fallback for binary NULL bodies: hydrate from live deque bytes if available."""
+        fid = entry.get("id")
+        if not fid:
+            return entry
+        live = self.get_live_flow(fid)
+        if not live:
+            return entry
+        # Request body fallback
+        req = entry.get("request")
+        if req is not None and req.get("body") is None:
+            try:
+                # Prefer decoded text if available, else surrogate-escaped bytes
+                txt = live.request.get_text(strict=False)
+                if txt is not None:
+                    req["body"] = txt
+                elif live.request.content:
+                    # surrogateescape preserves binary bytes as surrogates for diff detection
+                    req["body"] = live.request.content.decode("utf-8", errors="surrogateescape")
+            except Exception:
+                pass
+            # Also ensure headers fallback if missing? DB already has headers
+        # Response body fallback
+        resp = entry.get("response")
+        if resp is not None and resp.get("body") is None:
+            try:
+                if live.response:
+                    txt = live.response.get_text(strict=False)
+                    if txt is not None:
+                        resp["body"] = txt
+                    elif live.response.content:
+                        resp["body"] = live.response.content.decode("utf-8", errors="surrogateescape")
+            except Exception:
+                pass
+        # If response missing entirely but live has one, synthesize
+        if "response" not in entry and live.response:
+            try:
+                txt = live.response.get_text(strict=False)
+                if txt is None and live.response.content:
+                    txt = live.response.content.decode("utf-8", errors="surrogateescape")
+                entry["response"] = {
+                    "status_code": live.response.status_code,
+                    "headers": [[k.decode("latin-1"), v.decode("latin-1")] for k, v in live.response.headers.fields]
+                    if live.response.headers
+                    else [],
+                    "body": txt,
+                }
+            except Exception:
+                pass
+        return entry
+
     def get_by_ids(
         self,
         flow_ids: List[str],
         columns: Optional[List[str]] = None,
         ordered_headers: bool = False,
     ) -> List[Dict[str, Any]]:
-        return self.db.get_by_ids(flow_ids, columns=columns, ordered_headers=ordered_headers)
+        results = self.db.get_by_ids(flow_ids, columns=columns, ordered_headers=ordered_headers)
+        # Enrich binary NULL bodies from live flow deque when possible
+        enriched: List[Dict[str, Any]] = []
+        for entry in results:
+            enriched.append(self._enrich_with_live_flow(entry))
+        return enriched
+
+    def get_full_flow(self, flow_id: str, ordered_headers: bool = False) -> Optional[Dict[str, Any]]:
+        """Fetch full flow (request+response+metadata) with live fallback."""
+        raw = self.db.get_full_flow(flow_id, ordered_headers=ordered_headers)
+        if raw is None:
+            return None
+        return self._enrich_with_live_flow(raw)
