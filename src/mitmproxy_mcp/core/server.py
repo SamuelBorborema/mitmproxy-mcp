@@ -313,12 +313,12 @@ def live_flows() -> str:
 # --- MCP Tools ---
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
 async def start_proxy(
     port: Optional[int] = None,
     dump_file: Optional[str] = None,
     upstream_proxy: Optional[str] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Start the mitmproxy instance.
     Args:
@@ -329,34 +329,50 @@ async def start_proxy(
         upstream_proxy: Optional upstream proxy URL (e.g., 'http://user:pass@proxy:port').
     """
     try:
-        return await controller.start(
+        msg = await controller.start(
             port=port if port is not None else controller.default_port,
             host=controller.default_host,
             dump_file=dump_file,
             upstream_proxy=upstream_proxy,
         )
+        if msg.startswith("Couldn't") or "already running" in msg.lower():
+            status = "error" if msg.startswith("Couldn't") else "ok"
+            return {"status": status, "message": msg}
+        port_used = port if port is not None else controller.default_port
+        result: dict[str, Any] = {"status": "ok", "message": msg, "port": port_used, "host": controller.default_host}
+        if dump_file or controller.dump_file:
+            result["dump_file"] = dump_file or controller.dump_file
+        if upstream_proxy or controller.cli_upstream_proxy:
+            result["upstream_proxy"] = upstream_proxy or controller.cli_upstream_proxy
+        return result
     except Exception as e:
         logger.error("proxy_start_failed", error=str(e))
-        return f"Couldn't start the proxy: {str(e)}"
+        return {"status": "error", "message": f"Couldn't start the proxy: {str(e)}"}
 
 
-@mcp.tool()
-async def stop_proxy() -> str:
-    return await controller.stop()
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=False))
+async def stop_proxy() -> dict[str, Any]:
+    msg = await controller.stop()
+    status = "ok"
+    if "isn't running" in msg.lower():
+        status = "ok"
+    elif msg.startswith("Couldn't"):
+        status = "error"
+    return {"status": status, "message": msg}
 
 
-@mcp.tool()
-async def set_scope(allowed_domains: List[str]) -> str:
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
+async def set_scope(allowed_domains: List[str]) -> dict[str, Any]:
     controller.scope_manager.update_domains(allowed_domains)
     if allowed_domains:
         domains_str = ", ".join(allowed_domains)
     else:
         domains_str = "everything"
-    return f"Updated. Now tracking: {domains_str}"
+    return {"status": "ok", "message": f"Updated. Now tracking: {domains_str}", "allowed_domains": allowed_domains, "tracking": domains_str}
 
 
-@mcp.tool()
-async def set_global_header(key: str, value: str) -> str:
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
+async def set_global_header(key: str, value: str) -> dict[str, Any]:
     rule_id = f"global_{key.lower()}"
     rule = InterceptionRule(
         id=rule_id,
@@ -367,24 +383,24 @@ async def set_global_header(key: str, value: str) -> str:
         value=value,
     )
     controller.interceptor.add_rule(rule)
-    return f"Set global header: {key} = {value}"
+    return {"status": "ok", "message": f"Set global header: {key} = {value}", "rule_id": rule_id, "key": key, "value": value}
 
 
-@mcp.tool()
-async def remove_global_header(key: str) -> str:
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
+async def remove_global_header(key: str) -> dict[str, Any]:
     rule_id = f"global_{key.lower()}"
     controller.interceptor.remove_rule(rule_id)
-    return f"Removed global header: {key}"
+    return {"status": "ok", "message": f"Removed global header: {key}", "key": key, "rule_id": rule_id}
 
 
-@mcp.tool()
-async def get_traffic_summary(limit: int = 20) -> str:
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+async def get_traffic_summary(limit: int = 20) -> list[dict[str, Any]]:
     flows = controller.recorder.get_flow_summary(limit)
-    return json.dumps(flows, indent=2)
+    return flows
 
 
-@mcp.tool()
-async def inspect_flow(flow_id: str, full_body: bool = False) -> str:
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+async def inspect_flow(flow_id: str, full_body: bool = False) -> dict[str, Any]:
     """
     Get full details of a captured flow.
     Args:
@@ -394,21 +410,21 @@ async def inspect_flow(flow_id: str, full_body: bool = False) -> str:
     logger.debug("inspect_flow", flow_id=flow_id)
     data = controller.recorder.get_flow_detail(flow_id)
     if not data:
-        return "Couldn't find that flow."
+        return {"error": "Couldn't find that flow.", "flow_id": flow_id}
     if full_body and data.get("request"):
         flow_obj = controller.recorder.db.get_flow_object(flow_id)
         if flow_obj and flow_obj.body is not None:
             data["request"]["body"] = flow_obj.body
             data["request"].pop("body_preview", None)
-    return json.dumps(data, indent=2)
+    return data
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
 async def inspect_flows(
     flow_ids: str,
     fields: str = None,
     full_body: bool = False,
-) -> str:
+) -> list[dict[str, Any]]:
     """
     Batch inspect multiple flows in one call. Reduces context usage vs
     calling inspect_flow N times.
@@ -456,7 +472,7 @@ async def inspect_flows(
                 if flow_obj and flow_obj.body is not None:
                     req["body"] = flow_obj.body
 
-    return json.dumps(results, indent=2)
+    return results
 
 
 def _json_type_name(value: Any) -> str:
@@ -477,12 +493,12 @@ def _json_type_name(value: Any) -> str:
     return type(value).__name__
 
 
-@mcp.tool()
-async def get_flow_schema(flow_id: str) -> str:
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+async def get_flow_schema(flow_id: str) -> dict[str, str]:
     """Infer a simple schema from a flow's JSON response body."""
     flow_data = controller.recorder.get_flow_detail(flow_id)
     if not flow_data:
-        return "Flow not found."
+        return {"error": "Flow not found."}
 
     response = flow_data.get("response")
     body_content = response.get("body_preview") if response else None
@@ -497,26 +513,26 @@ async def get_flow_schema(flow_id: str) -> str:
             body_content = str(full_content)
 
     if not body_content:
-        return "Flow has no response body."
+        return {"error": "Flow has no response body."}
 
     try:
         data = json.loads(body_content)
     except json.JSONDecodeError:
-        return "Response body is not valid JSON."
+        return {"error": "Response body is not valid JSON."}
 
     if not isinstance(data, dict):
-        return f"Response is JSON but not an object (it's {type(data).__name__})."
+        return {"error": f"Response is JSON but not an object (it's {type(data).__name__})."}
 
     schema = {key: _json_type_name(value) for key, value in data.items()}
-    return json.dumps(schema, indent=2)
+    return schema
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=False))
 async def load_traffic_file(
     file_path: str,
     append: bool = False,
     scope: str = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Import flows from a HAR or mitmproxy flow file into the traffic database.
     After import, all traffic inspection tools work on the imported data.
@@ -536,32 +552,30 @@ async def load_traffic_file(
         requested_path = Path(file_path).resolve()
         base_dir = Path.cwd().resolve()
         if not str(requested_path).startswith(str(base_dir)):
-            return json.dumps({
+            return {
                 "status": "error",
                 "message": f"Security Error: Access denied to {file_path}. Path must be within the project directory."
-            })
+            }
     except Exception as e:
-        return json.dumps({"status": "error", "message": f"Invalid path: {str(e)}"})
+        return {"status": "error", "message": f"Invalid path: {str(e)}"}
 
     try:
         stats = await asyncio.to_thread(
             controller.recorder.db.import_from_file,
             str(requested_path), append=append, scope=scope_list
         )
-        return json.dumps(
-            {
+        return {
                 "status": "ok",
                 "imported": stats["imported"],
                 "skipped": stats["skipped"],
                 "errors": stats["errors"],
             }
-        )
     except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
+        return {"status": "error", "message": str(e)}
 
 
-@mcp.tool()
-async def extract_from_flow(flow_id: str, json_path: str = None, css_selector: str = None) -> str:
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+async def extract_from_flow(flow_id: str, json_path: str = None, css_selector: str = None) -> list[Any] | dict[str, Any]:
     """
     Extract specific data from a flow's response body using JSONPath or CSS
     selectors.
@@ -572,12 +586,12 @@ async def extract_from_flow(flow_id: str, json_path: str = None, css_selector: s
     """
     flow_data = controller.recorder.get_flow_detail(flow_id)
     if not flow_data:
-        return "No matching flow."
+        return {"error": "No matching flow."}
 
     response = flow_data.get("response")
     body_content = response.get("body_preview") if response else None
     if not body_content:
-        return "Flow has no response body."
+        return {"error": "Flow has no response body."}
 
     if json_path:
         try:
@@ -586,11 +600,11 @@ async def extract_from_flow(flow_id: str, json_path: str = None, css_selector: s
             # Apply JSONPath
             jsonpath_expr = parse_jsonpath(json_path)
             matches = [match.value for match in jsonpath_expr.find(data)]
-            return json.dumps(matches, indent=2)
+            return matches
         except json.JSONDecodeError:
-            return "Response body is not valid JSON."
+            return {"error": "Response body is not valid JSON."}
         except Exception as e:
-            return f"Error executing JSONPath: {str(e)}"
+            return {"error": f"Error executing JSONPath: {str(e)}"}
 
     if css_selector:
         try:
@@ -601,20 +615,20 @@ async def extract_from_flow(flow_id: str, json_path: str = None, css_selector: s
             for el in elements:
                 result.append({"text": el.get_text(strip=True), "html": str(el), "attrs": el.attrs})
 
-            return json.dumps(result, indent=2)
+            return result
         except Exception as e:
-            return f"Error executing CSS Selector: {str(e)}"
+            return {"error": f"Error executing CSS Selector: {str(e)}"}
 
-    return "You must provide a json_path or a css_selector."
+    return {"error": "You must provide a json_path or a css_selector."}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
 async def search_traffic(
     query: str = None,
     domain: str = None,
     method: str = None,
     limit: int = 50,
-) -> str:
+) -> list[dict[str, Any]]:
     """
     Search captured traffic using filters.
     Args:
@@ -624,20 +638,20 @@ async def search_traffic(
         limit: Max results to return
     """
     results = controller.recorder.search(query, domain, method, limit)
-    return json.dumps(results, indent=2)
+    return results
 
 
-@mcp.tool()
-async def set_session_variable(name: str, value: str) -> str:
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
+async def set_session_variable(name: str, value: str) -> dict[str, Any]:
     """Manually set a session variable to use in replayed flows."""
     controller.session_variables[name] = value
-    return f"Set session variable ${name} = {value}"
+    return {"status": "ok", "message": f"Set session variable ${name} = {value}", "name": name, "value": value}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
 async def extract_session_variable(
     name: str, flow_id: str, regex_pattern: str, group_index: int = 1
-) -> str:
+) -> dict[str, Any]:
     """
     Extract a value from a flow's response body using a regex and store it as a session variable.
     Args:
@@ -648,22 +662,22 @@ async def extract_session_variable(
     """
     flow_data = controller.recorder.get_flow_detail(flow_id)
     if not flow_data:
-        return "No matching flow."
+        return {"status": "error", "message": "No matching flow.", "flow_id": flow_id}
 
     response = flow_data.get("response")
     body_content = response.get("body_preview") if response else None
     if not body_content:
-        return "Flow has no response body."
+        return {"status": "error", "message": "Flow has no response body.", "flow_id": flow_id}
     try:
         match = re2.search(regex_pattern, body_content)
         if match:
             value = match.group(group_index)
             controller.session_variables[name] = value
-            return f"Extracted and set ${name} = {value}"
+            return {"status": "ok", "message": f"Extracted and set ${name} = {value}", "name": name, "value": value}
         else:
-            return f"Pattern not found in response body."
+            return {"status": "error", "message": f"Pattern not found in response body.", "name": name}
     except Exception as e:
-        return f"Error applying regex: {str(e)}"
+        return {"status": "error", "message": f"Error applying regex: {str(e)}"}
 
 
 def _resolve_template(template_str: str, variables: dict) -> str:
@@ -674,21 +688,21 @@ def _resolve_template(template_str: str, variables: dict) -> str:
     return result
 
 
-@mcp.tool()
-async def clear_traffic() -> str:
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=False))
+async def clear_traffic() -> dict[str, Any]:
     """Clear all captured traffic from the database."""
     controller.recorder.clear()
-    return "Cleared all traffic history."
+    return {"status": "ok", "message": "Cleared all traffic history."}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=True))
 async def fuzz_endpoint(
     flow_id: str,
     target_param: str,
     param_type: str,
     payload_category: str,
     timeout: float = 10.0,
-) -> str:
+) -> dict[str, Any]:
     """
     Fuzz an endpoint by substituting a target parameter with a category of
     DAST payloads.
@@ -701,7 +715,7 @@ async def fuzz_endpoint(
     """
     flow_data = controller.recorder.get_flow_detail(flow_id)
     if not flow_data:
-        return "No matching flow."
+        return {"status": "error", "message": "No matching flow.", "flow_id": flow_id}
 
     if payload_category == "sqli":
         payloads = [
@@ -724,7 +738,7 @@ async def fuzz_endpoint(
             "/windows/win.ini",
         ]
     else:
-        return "Unknown payload category. Use 'sqli', 'xss', or 'path_traversal'."
+        return {"status": "error", "message": "Unknown payload category. Use 'sqli', 'xss', or 'path_traversal'.", "payload_category": payload_category}
 
     original_request = flow_data["request"]
     base_url = original_request["url"]
@@ -798,9 +812,9 @@ async def fuzz_endpoint(
                         body_data[target_param] = payload
                     req_body = json.dumps(body_data)
                 except Exception as e:
-                    return f"Failed to parse or modify JSON body: {str(e)}"
+                    return {"status": "error", "message": f"Failed to parse or modify JSON body: {str(e)}"}
             else:
-                return "Unknown param_type. Use 'query' or 'json_body'."
+                return {"status": "error", "message": "Unknown param_type. Use 'query' or 'json_body'.", "param_type": param_type}
 
             # Coroutine for the request
             async def run_req(p=payload, u=req_url, b=req_body):
@@ -858,26 +872,29 @@ async def fuzz_endpoint(
                 anomalies.append(r)
 
     if not anomalies:
-        return "Fuzzing complete, No significant anomalies detected."
+        return {
+            "status": "ok",
+            "message": "Fuzzing complete, No significant anomalies detected.",
+            "baseline_status": baseline_status,
+            "baseline_len": baseline_len,
+            "anomalies": [],
+        }
 
-    return json.dumps(
-        {
+    return {
             "baseline_status": baseline_status,
             "baseline_len": baseline_len,
             "anomalies": anomalies,
-        },
-        indent=2,
-    )
+        }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True))
 async def replay_flow(
     flow_id: str,
     method: str = None,
     headers_json: str = None,
     body: str = None,
     timeout: float = 30.0,
-) -> str:
+) -> dict[str, Any]:
     """
     Replay a captured flow, optionally with modified method, headers, or body.
     Supports session variable injection (e.g., $token) in headers and body.
@@ -904,18 +921,24 @@ async def replay_flow(
         try:
             parsed_headers = json.loads(resolved_headers_json)
         except json.JSONDecodeError:
-            return "The headers_json parameter needs to be valid JSON."
+            return {"status": "error", "message": "The headers_json parameter needs to be valid JSON."}
 
-    return await controller.replay_request(
+    msg = await controller.replay_request(
         flow_id,
         method,
         parsed_headers,
         resolved_body,
         timeout,
     )
+    if msg.startswith("Replayed successfully"):
+        return {"status": "ok", "message": msg, "flow_id": flow_id}
+    elif "Couldn't find" in msg or "That didn't work" in msg:
+        return {"status": "error", "message": msg, "flow_id": flow_id}
+    else:
+        return {"status": "ok", "message": msg, "flow_id": flow_id}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
 async def add_interception_rule(
     rule_id: str,
     action_type: str,
@@ -925,9 +948,9 @@ async def add_interception_rule(
     value: str = None,
     search_pattern: str = None,
     phase: str = "request",
-) -> str:
+) -> dict[str, Any]:
     if phase not in ["request", "response"]:
-        return "Phase needs to be either 'request' or 'response'"
+        return {"status": "error", "message": "Phase needs to be either 'request' or 'response'"}
 
     try:
         rule = InterceptionRule(
@@ -941,15 +964,15 @@ async def add_interception_rule(
             search_pattern=search_pattern,
         )
     except Exception as e:
-        return f"Invalid rule parameters: {str(e)}"
+        return {"status": "error", "message": f"Invalid rule parameters: {str(e)}"}
 
     if not controller.interceptor.add_rule(rule):
-        return f"Invalid or unsupported regex for rule '{rule_id}'"
-    return f"Added rule '{rule_id}'"
+        return {"status": "error", "message": f"Invalid or unsupported regex for rule '{rule_id}'"}
+    return {"status": "ok", "message": f"Added rule '{rule_id}'", "rule_id": rule_id}
 
 
-@mcp.tool()
-async def list_rules() -> str:
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+async def list_rules() -> dict[str, Any]:
     rules_dict = {
         rid: {
             "action": r.action_type,
@@ -958,17 +981,17 @@ async def list_rules() -> str:
         }
         for rid, r in controller.interceptor.rules.items()
     }
-    return json.dumps(rules_dict, indent=2)
+    return rules_dict
 
 
-@mcp.tool()
-async def clear_rules() -> str:
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=False))
+async def clear_rules() -> dict[str, Any]:
     controller.interceptor.clear_rules()
-    return "Cleared all interception rules."
+    return {"status": "ok", "message": "Cleared all interception rules."}
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
-async def proxy_status() -> dict:
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+async def proxy_status() -> dict[str, Any]:
     """Return current proxy/server status."""
     # uptime calculation is monotonic and cheap
     uptime_seconds: Optional[float] = None
@@ -1017,8 +1040,8 @@ async def proxy_status() -> dict:
     }
 
 
-@mcp.tool()
-async def list_tools() -> str:
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+async def list_tools() -> list[dict[str, Any]]:
     """List all available tools with their descriptions."""
     tools = await mcp.list_tools()
     tool_list = []
@@ -1026,7 +1049,7 @@ async def list_tools() -> str:
         tool_list.append(
             {"name": tool.name, "description": tool.description, "input_schema": tool.input_schema}
         )
-    return json.dumps(tool_list, indent=2)
+    return tool_list
 
 
 # --- API Analysis Tools (Updated for Dicts) ---
@@ -1161,26 +1184,28 @@ def _generate_openapi_spec(
     return spec
 
 
-@mcp.tool()
-async def export_openapi_spec(domain: str = None, limit: int = None) -> str:
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+async def export_openapi_spec(domain: str = None, limit: int = None) -> dict[str, Any]:
     """
     Exports captured API traffic patterns to an OpenAPI v3 JSON specification.
     Args:
         domain: Filter traffic by domain
         limit: Max number of traffic flows to analyze. None = all flows.
     """
-    patterns_json = await get_api_patterns(domain, limit)
-    clusters = json.loads(patterns_json)
+    clusters = await get_api_patterns(domain, limit)
+    # Handle legacy string case (if get_api_patterns returned JSON string in older version)
+    if isinstance(clusters, str):
+        clusters = json.loads(clusters)
 
     spec = _generate_openapi_spec(
         clusters,
         title=f"Reconstructed API - {domain if domain else 'All'}",
     )
-    return json.dumps(spec, indent=2)
+    return spec
 
 
-@mcp.tool()
-async def get_api_patterns(domain: str = None, limit: int = None) -> str:
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+async def get_api_patterns(domain: str = None, limit: int = None) -> list[dict[str, Any]]:
     """
     Cluster captured traffic into endpoint patterns.
     Args:
@@ -1260,11 +1285,11 @@ async def get_api_patterns(domain: str = None, limit: int = None) -> str:
             }
         )
 
-    return json.dumps(result, indent=2)
+    return result
 
 
-@mcp.tool()
-async def detect_auth_pattern(flow_ids: str = None) -> str:
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+async def detect_auth_pattern(flow_ids: str = None) -> dict[str, Any]:
     if flow_ids:
         target_ids = [fid.strip() for fid in flow_ids.split(",") if fid.strip()]
         flows = controller.recorder.get_by_ids(target_ids)
@@ -1352,16 +1377,13 @@ async def detect_auth_pattern(flow_ids: str = None) -> str:
 
     detected = [k for k, v in auth_signals.items() if v["detected"]]
 
-    return json.dumps(
-        {
+    return {
             "detected_auth_types": detected,
             "details": auth_signals,
-        },
-        indent=2,
-    )
+        }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
 async def generate_scraper_code(flow_ids: str, target_framework: str = "curl_cffi") -> str:
     """
     Generate executable scraper/automation code from a comma-separated list of

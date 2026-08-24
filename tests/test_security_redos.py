@@ -48,7 +48,12 @@ async def test_add_interception_rule_reports_unsupported_regex():
         url_pattern=r"foo(?=bar)",
     )
 
-    assert result == "Invalid or unsupported regex for rule 'lookahead_api_test'"
+    # Structured output: dict with status/message; legacy was plain string
+    if isinstance(result, dict):
+        assert result.get("status") == "error"
+        assert result.get("message") == "Invalid or unsupported regex for rule 'lookahead_api_test'"
+    else:
+        assert result == "Invalid or unsupported regex for rule 'lookahead_api_test'"
 
 
 @pytest.mark.asyncio
@@ -61,4 +66,9 @@ async def test_extract_session_variable_rejects_unsupported_regex(monkeypatch):
 
     result = await extract_session_variable("token", "flow-id", r"foo(?=bar)")
 
-    assert result.startswith("Error applying regex:")
+    # Structured output: dict with status/message
+    if isinstance(result, dict):
+        assert result.get("status") == "error"
+        assert result.get("message", "").startswith("Error applying regex:")
+    else:
+        assert result.startswith("Error applying regex:")

@@ -27,7 +27,8 @@ async def test_get_flow_schema_json_object(monkeypatch):
     )
 
     result = await server.get_flow_schema(flow_id)
-    schema = json.loads(result)
+    # Structured output: result is already a dict; legacy was JSON string
+    schema = result if isinstance(result, dict) and "error" not in result else json.loads(result) if isinstance(result, str) else result
 
     expected = {
         "id": "int",
@@ -72,7 +73,7 @@ async def test_get_flow_schema_full_body_from_db(monkeypatch):
     )
 
     result = await server.get_flow_schema(flow_id)
-    schema = json.loads(result)
+    schema = result if isinstance(result, dict) and "error" not in result else json.loads(result) if isinstance(result, str) else result
 
     expected = {
         "user_id": "int",
@@ -103,7 +104,11 @@ async def test_get_flow_schema_not_json(monkeypatch):
     )
 
     result = await server.get_flow_schema(flow_id)
-    assert result == "Response body is not valid JSON."
+    # Structured output returns {"error": "..."} for errors
+    if isinstance(result, dict):
+        assert result.get("error") == "Response body is not valid JSON."
+    else:
+        assert result == "Response body is not valid JSON."
 
 
 @pytest.mark.asyncio
@@ -128,7 +133,10 @@ async def test_get_flow_schema_json_array(monkeypatch):
     )
 
     result = await server.get_flow_schema(flow_id)
-    assert result == "Response is JSON but not an object (it's list)."
+    if isinstance(result, dict):
+        assert result.get("error") == "Response is JSON but not an object (it's list)."
+    else:
+        assert result == "Response is JSON but not an object (it's list)."
 
 
 @pytest.mark.asyncio
@@ -143,4 +151,7 @@ async def test_get_flow_schema_flow_not_found(monkeypatch):
     )
 
     result = await server.get_flow_schema("nonexistent")
-    assert result == "Flow not found."
+    if isinstance(result, dict):
+        assert result.get("error") == "Flow not found."
+    else:
+        assert result == "Flow not found."

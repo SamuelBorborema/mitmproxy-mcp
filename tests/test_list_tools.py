@@ -6,7 +6,8 @@ from mitmproxy_mcp.core.server import list_tools
 @pytest.mark.asyncio
 async def test_list_tools():
     result = await list_tools()
-    tools = json.loads(result)
+    # Structured output: result is already a list; legacy was JSON string
+    tools = result if isinstance(result, list) else json.loads(result)
 
     # Verify we get a list
     assert isinstance(tools, list)
