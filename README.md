@@ -34,6 +34,7 @@ Standard "web search" or "fetch" tools are stateless and easily detected. mitmpr
 - **API Discovery**: Group similar endpoints, identify path/query params, and export OpenAPI JSON.
 - **Security Recon Helpers**: Detect common auth patterns and run targeted fuzz payloads.
 - **Scraper Bootstrapping**: Generate executable `curl-cffi` automation code from observed traffic.
+- **Live Flow Subscription**: Subscribe to `flows://live` (MCP resource) via `subscriptions/listen` for real-time `ResourceUpdated` notifications when new flows are captured.
 
 > **Why this fork?** The upstream PyPI release (`mitmproxy-mcp` 0.6.x) crashes with
 > `mcp >= 2` because it imports `mcp.server.fastmcp`, a module removed in mcp 2.x.
@@ -149,6 +150,10 @@ pip install git+https://github.com/SamuelBorborema/mitmproxy-mcp
 ### Code Generation
 
 * `generate_scraper_code(flow_ids, target_framework="curl_cffi")`: Generate starter scraper/automation code from captured flows.
+
+### Resources / Subscriptions
+
+* `flows://live` (resource, `application/json`): Snapshot of the latest 20 captured flows. Subscribe via MCP `subscriptions/listen` with filter `{"resource_subscriptions": ["flows://live"]}` to receive `notifications/resources/updated` whenever a new flow is saved.
 
 ## Programmatic Usage
 
