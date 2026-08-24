@@ -15,6 +15,7 @@ import re2
 import structlog
 
 from mcp.server.mcpserver import MCPServer
+from mcp.shared.subscriptions import ResourceUpdated
 from mcp.types import ToolAnnotations
 from mitmproxy import options
 from mitmproxy.tools.dump import DumpMaster
@@ -265,6 +266,49 @@ async def _lifespan(_server):
 
 
 mcp = MCPServer(name="Mitmproxy Manager", lifespan=_lifespan)
+
+LIVE_FLOWS_URI = "flows://live"
+
+
+def _notify_live_flow() -> None:
+    """Publish ResourceUpdated for flows://live via the server's subscription bus.
+
+    Called from TrafficRecorder hooks (which are synchronous mitmproxy addon
+    callbacks). Since those hooks run on the same asyncio loop as the
+    DumpMaster task, it is safe to schedule the async publish via
+    call_soon_threadsafe / create_task. Do not raise in this path.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    try:
+        loop.create_task(mcp._subscriptions.publish(ResourceUpdated(uri=LIVE_FLOWS_URI)))
+    except RuntimeError:
+        # Fallback if loop is closed or task creation fails
+        try:
+            asyncio.create_task(mcp._subscriptions.publish(ResourceUpdated(uri=LIVE_FLOWS_URI)))
+        except RuntimeError:
+            pass
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"Failed to publish live flow update: {e}", file=sys.stderr)
+
+
+# Wire live-flow notifications without importing mcp inside recorder.py
+controller.recorder.on_flow = _notify_live_flow
+
+
+@mcp.resource(LIVE_FLOWS_URI, mime_type="application/json", description="Live captured flows (latest 20)")
+def live_flows() -> str:
+    """Return a snapshot of the latest captured flows as JSON.
+
+    This resource is designed for live subscription: clients can
+    `subscriptions/listen` with a filter for this URI and will receive
+    `ResourceUpdated` notifications whenever a new flow is saved.
+    """
+    flows = controller.recorder.get_flow_summary(limit=20)
+    return json.dumps(flows, indent=2)
+
 
 # --- MCP Tools ---
 
@@ -1396,6 +1440,8 @@ def start():
     controller.default_port = args.port
     controller.default_host = args.host
     controller.auto_start = args.auto_start
+    # Re-wire live flow subscription for the new controller instance
+    controller.recorder.on_flow = _notify_live_flow
 
     mcp.run()
 

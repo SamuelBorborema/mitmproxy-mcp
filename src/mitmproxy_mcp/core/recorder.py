@@ -4,7 +4,7 @@ import shlex
 import sqlite3
 import sys
 from collections import deque
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 from mitmproxy import http
@@ -493,6 +493,19 @@ class TrafficRecorder:
         # Keep a small in-memory deque of objects for legacy usage (like replay)
         # Note: This buffer is non-persistent, SQLite is the main storage.
         self.flows = deque(maxlen=500)
+        # Optional callback injected by server.py to publish ResourceUpdated
+        # events on flow save. Kept as Optional[Callable[[], None]] to avoid
+        # circular imports; server wires `recorder.on_flow = _notify_live_flow`.
+        self.on_flow: Optional[Callable[[], None]] = None
+
+    def _notify(self) -> None:
+        """Invoke the live-flow callback if wired, never raising."""
+        if self.on_flow is None:
+            return
+        try:
+            self.on_flow()
+        except Exception as e:
+            print(f"Failed to notify live flow subscriber: {e}", file=sys.stderr)
 
     def request(self, flow: http.HTTPFlow):
         if self.scope.is_allowed(flow):
@@ -503,6 +516,7 @@ class TrafficRecorder:
                     f"DEBUG: Request saved for {flow.request.url}",
                     file=sys.stderr,
                 )
+                self._notify()
             except Exception as e:
                 print(f"Failed to save request flow: {e}", file=sys.stderr)
 
@@ -516,6 +530,7 @@ class TrafficRecorder:
                 self.db.save_flow(flow)
                 self.flows.append(flow)
                 print(f"DEBUG: Saved flow {flow.id}", file=sys.stderr)
+                self._notify()
             except Exception as e:
                 print(f"Failed to save flow: {e}", file=sys.stderr)
 
@@ -524,6 +539,7 @@ class TrafficRecorder:
             try:
                 self.db.save_flow(flow)
                 self.flows.append(flow)
+                self._notify()
             except Exception as e:
                 print(f"Failed to save flow error: {e}", file=sys.stderr)
 
