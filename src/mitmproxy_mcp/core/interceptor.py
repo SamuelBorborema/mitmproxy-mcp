@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 import re2
 from mitmproxy import http
 from ..models import InterceptionRule
@@ -14,6 +14,9 @@ class TrafficInterceptor:
     def __init__(self):
         self.rules: Dict[str, InterceptionRule] = {}
         self._compiled_patterns: Dict[str, Dict[str, Any]] = {}
+        self.intercept_filter: Optional[str] = None
+        self._intercept_pattern = None
+        self.intercepted_flows: Dict[str, http.HTTPFlow] = {}
 
     def add_rule(self, rule: InterceptionRule) -> bool:
         patterns = {}
@@ -44,7 +47,59 @@ class TrafficInterceptor:
     def get_active_rules(self):
         return list(self.rules.values())
 
+    def set_intercept_filter(self, pattern: Optional[str]) -> bool:
+        if not pattern:
+            self.intercept_filter = None
+            self._intercept_pattern = None
+            return True
+        try:
+            self._intercept_pattern = re2.compile(pattern)
+        except re2.error as e:
+            logger.warning("Failed to compile intercept filter: %s", e)
+            return False
+        self.intercept_filter = pattern
+        return True
+
+    def get_intercepted_flows(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "id": flow_id,
+                "method": flow.request.method,
+                "url": flow.request.url,
+                "status": "intercepted",
+                "timestamp": flow.request.timestamp_start,
+            }
+            for flow_id, flow in self.intercepted_flows.items()
+        ]
+
+    def resume_flow(self, flow_id: str) -> bool:
+        flow = self.intercepted_flows.pop(flow_id, None)
+        if flow is None:
+            return False
+        flow.resume()
+        return True
+
+    def resume_all(self) -> int:
+        count = 0
+        for flow in self.intercepted_flows.values():
+            flow.resume()
+            count += 1
+        self.intercepted_flows.clear()
+        return count
+
+    def drop_flow(self, flow_id: str) -> bool:
+        flow = self.intercepted_flows.pop(flow_id, None)
+        if flow is None:
+            return False
+        flow.kill()
+        return True
+
     def request(self, flow: http.HTTPFlow):
+        if self.intercept_filter and self._intercept_pattern:
+            if self._intercept_pattern.search(flow.request.url):
+                flow.intercept()
+                self.intercepted_flows[flow.id] = flow
+                return
         self._apply_rules(flow, "request")
 
     def response(self, flow: http.HTTPFlow):
