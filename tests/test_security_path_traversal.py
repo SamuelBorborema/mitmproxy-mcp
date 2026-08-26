@@ -40,9 +40,19 @@ async def test_valid_path_allowed(tmp_path):
     try:
         result_str = await load_traffic_file("test_safe_import.har")
         result = result_str if isinstance(result_str, dict) else json.loads(result_str)
-        
+
         # Should NOT be a security error
         assert result["status"] == "ok"
     finally:
         if local_file.exists():
             os.remove(local_file)
+
+@pytest.mark.asyncio
+async def test_sibling_directory_prefix_denied(tmp_path):
+    """Verify that a sibling directory sharing the same prefix is blocked."""
+    result_str = await load_traffic_file("../" + Path.cwd().name + "-evil/malicious.har")
+    result = result_str if isinstance(result_str, dict) else json.loads(result_str)
+
+    assert result["status"] == "error"
+    assert "Security Error" in result["message"]
+    assert "Access denied" in result["message"]

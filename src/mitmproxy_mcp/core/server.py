@@ -895,7 +895,7 @@ async def load_traffic_file(
     try:
         requested_path = Path(file_path).resolve()
         base_dir = Path.cwd().resolve()
-        if not str(requested_path).startswith(str(base_dir)):
+        if not str(requested_path).startswith(str(base_dir) + os.sep) and str(requested_path) != str(base_dir):
             return {
                 "status": "error",
                 "message": f"Security Error: Access denied to {file_path}. Path must be within the project directory."
