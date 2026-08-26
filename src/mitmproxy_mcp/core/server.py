@@ -258,6 +258,52 @@ class MitmController:
             logger.error(f"Replay failed: {e}")
             return f"That didn't work: {str(e)}"
 
+    async def send_request(
+        self,
+        method: str,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        body: Optional[str] = None,
+        timeout: float = 30.0,
+    ) -> str:
+        if not self.running:
+            return "The proxy isn't running. Start it first with start_proxy."
+
+        target_method = method.upper()
+        proxy_url = f"http://127.0.0.1:{self.port}"
+
+        logger.info(
+            "send_request",
+            method=target_method,
+            url=url,
+            mode="stealth",
+        )
+
+        try:
+            async with AsyncSession(
+                impersonate="chrome120",
+                proxies={
+                    "http": proxy_url,
+                    "https": proxy_url,
+                },
+                verify=self._get_verify_param(),
+                timeout=timeout,
+            ) as client:
+                request_kwargs: Dict[str, Any] = {
+                    "method": target_method,
+                    "url": url,
+                    "headers": headers or {},
+                }
+                if body is not None:
+                    request_kwargs["data"] = body
+
+                response = await client.request(**request_kwargs)
+
+            return f"Request sent successfully! (Status: {response.status_code}). Check the traffic summary for the new flow."
+        except Exception as e:
+            logger.error(f"Send request failed: {e}")
+            return f"Request failed: {str(e)}"
+
 
 # Global Controller Instance
 controller = MitmController()
@@ -1618,6 +1664,40 @@ async def replay_flow(
         return {"status": "error", "message": msg, "flow_id": flow_id}
     else:
         return {"status": "ok", "message": msg, "flow_id": flow_id}
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True))
+async def send_request(
+    method: str,
+    url: str,
+    headers_json: str = None,
+    body: str = None,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """
+    Send a new HTTP request through the proxy. Unlike replay_flow, this does not
+    require a previously captured flow. The request is captured as a new flow.
+    Args:
+        method: HTTP method (GET, POST, PUT, DELETE, PATCH, etc.)
+        url: Full URL to request (e.g., https://api.example.com/data)
+        headers_json: Optional JSON string of headers (e.g., '{"Authorization": "Bearer token"}')
+        body: Optional request body string
+        timeout: Request timeout in seconds (default 30)
+    """
+    parsed_headers = None
+    if headers_json:
+        try:
+            parsed_headers = json.loads(headers_json)
+        except json.JSONDecodeError:
+            return {"status": "error", "message": "The headers_json parameter needs to be valid JSON."}
+
+    msg = await controller.send_request(method, url, parsed_headers, body, timeout)
+    if msg.startswith("Request sent successfully"):
+        return {"status": "ok", "message": msg}
+    elif "isn't running" in msg.lower():
+        return {"status": "error", "message": msg}
+    else:
+        return {"status": "error", "message": msg}
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
