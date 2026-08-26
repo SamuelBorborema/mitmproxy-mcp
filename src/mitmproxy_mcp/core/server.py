@@ -1436,7 +1436,7 @@ async def fuzz_endpoint(
         else:
             baseline_status = 200
 
-        if baseline_flow and baseline_flow.response and baseline_flow.response.body:
+        if baseline_flow and baseline_flow.response and baseline_flow.response.body is not None:
             baseline_len = len(baseline_flow.response.body)
         else:
             baseline_len = 0
