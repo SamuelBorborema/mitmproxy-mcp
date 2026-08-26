@@ -1672,6 +1672,57 @@ async def clear_rules() -> dict[str, Any]:
     return {"status": "ok", "message": "Cleared all interception rules."}
 
 
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
+async def set_intercept_filter(pattern: str = "") -> dict[str, Any]:
+    """Set a regex filter to intercept (hold) matching requests in-flight.
+    Matching flows are paused until resumed or dropped.
+    Pass empty string to disable interception.
+    Args:
+        pattern: Regex pattern to match against request URLs. Empty string disables.
+    """
+    if not pattern:
+        controller.interceptor.set_intercept_filter(None)
+        return {"status": "ok", "message": "Interception disabled"}
+    if not controller.interceptor.set_intercept_filter(pattern):
+        return {"status": "error", "message": "Invalid regex pattern"}
+    return {"status": "ok", "message": f"Intercepting flows matching: {pattern}", "pattern": pattern}
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+async def get_intercepted_flows() -> list[dict[str, Any]]:
+    """List all currently intercepted (held) flows."""
+    return controller.interceptor.get_intercepted_flows()
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False))
+async def resume_flow(flow_id: str) -> dict[str, Any]:
+    """Resume a single intercepted flow, allowing it to continue to the server.
+    Args:
+        flow_id: The ID of the intercepted flow to resume
+    """
+    if not controller.interceptor.resume_flow(flow_id):
+        return {"status": "error", "message": "Flow not found in intercepted list"}
+    return {"status": "ok", "message": f"Resumed flow {flow_id}", "flow_id": flow_id}
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False))
+async def resume_all_flows() -> dict[str, Any]:
+    """Resume all currently intercepted flows."""
+    count = controller.interceptor.resume_all()
+    return {"status": "ok", "message": f"Resumed {count} flows", "resumed_count": count}
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=False))
+async def drop_flow(flow_id: str) -> dict[str, Any]:
+    """Drop (kill) an intercepted flow, preventing it from reaching the server.
+    Args:
+        flow_id: The ID of the intercepted flow to drop
+    """
+    if not controller.interceptor.drop_flow(flow_id):
+        return {"status": "error", "message": "Flow not found in intercepted list"}
+    return {"status": "ok", "message": f"Dropped flow {flow_id}", "flow_id": flow_id}
+
+
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
 async def proxy_status() -> dict[str, Any]:
     """Return current proxy/server status. Includes flow duration (time between request start and response end) stored per flow in the DB."""
