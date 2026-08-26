@@ -189,6 +189,8 @@ class MitmController:
         """
         Re-executes captured request using curl_cffi
         """
+        if not self.running:
+            return "The proxy isn't running. Start it first with start_proxy."
         # Fetch flow details from DB (dict)
         flow_data = self.recorder.get_flow_detail(flow_id)
         if not flow_data:
@@ -1587,6 +1589,9 @@ async def replay_flow(
     if resolved_body == "__omit__":
         resolved_body = None
 
+    if not controller.running:
+        return {"status": "error", "message": "The proxy isn't running. Start it first with start_proxy.", "flow_id": flow_id}
+
     if controller.session_variables:
         if resolved_headers_json:
             resolved_headers_json = _resolve_template(
@@ -1611,7 +1616,7 @@ async def replay_flow(
     )
     if msg.startswith("Replayed successfully"):
         return {"status": "ok", "message": msg, "flow_id": flow_id}
-    elif "Couldn't find" in msg or "That didn't work" in msg:
+    elif "Couldn't find" in msg or "That didn't work" in msg or "isn't running" in msg.lower():
         return {"status": "error", "message": msg, "flow_id": flow_id}
     else:
         return {"status": "ok", "message": msg, "flow_id": flow_id}
