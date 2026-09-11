@@ -32,7 +32,7 @@ from bs4 import BeautifulSoup
 
 from ..models import ScopeConfig, InterceptionRule
 from .scope import ScopeManager
-from .recorder import TrafficRecorder
+from .recorder import TrafficRecorder, _env_int
 from .interceptor import TrafficInterceptor
 from .generation import normalize_scraper_flows, render_scraper_code
 from .diff import diff_bodies, diff_headers, diff_size, diff_status, diff_timestamp
@@ -828,7 +828,7 @@ async def get_websocket_messages(
     flow_id: str,
     limit: int = 100,
     offset: int = 0,
-    direction: str = None,
+    direction: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Get stored WebSocket frames for a flow with paginated access.
 
@@ -839,8 +839,8 @@ async def get_websocket_messages(
         flow_id: The ID of the captured WebSocket flow (101 handshake).
         limit: Max frames to return (default 100, max 1000). Paginate via offset.
         offset: Frame offset to start from (default 0, ordered by seq ASC).
-        direction: Optional filter: "client" (client->server) or "server"
-            (server->client). Omit for both directions.
+        direction: Optional filter (case-insensitive): "client" (client->server)
+            or "server" (server->client). Omit for both directions.
 
     Returns:
         Dict with flow_id, is_websocket, total_observed, stored,
@@ -853,9 +853,12 @@ async def get_websocket_messages(
         limit = 0
     if offset < 0:
         offset = 0
-    data = controller.recorder.db.get_websocket_messages(
-        flow_id, limit=limit, offset=offset, direction=direction
-    )
+    try:
+        data = controller.recorder.db.get_websocket_messages(
+            flow_id, limit=limit, offset=offset, direction=direction
+        )
+    except ValueError as e:
+        return {"error": str(e), "flow_id": flow_id}
     if data is None:
         return {"error": "Couldn't find that flow.", "flow_id": flow_id}
     if not data.get("is_websocket"):
@@ -1170,6 +1173,9 @@ async def export_har(
 
         # Reconstruct flows for SaveHar
         flows: List[Any] = []
+        # Flow IDs whose WS frames were dropped by safety-valve caps or stored
+        # truncated: their HAR _webSocketMessages are partial approximations.
+        ws_export_warnings: List[str] = []
         # Import here to avoid circular
         from mitmproxy import connection as mitm_connection
         from mitmproxy import http as mitm_http
@@ -1308,10 +1314,31 @@ async def export_har(
                 except Exception:
                     pass
                 # Rehydrate WebSocket frames so SaveHar emits _webSocketMessages.
+                # Paginated: get_websocket_messages clamps limit to 1000.
                 try:
-                    ws_data = db.get_websocket_messages(row["id"], limit=10000, offset=0)
-                    ws_msgs = (ws_data.get("messages") or []) if ws_data else []
+                    ws_msgs_all: list = []
+                    ws_data = None
+                    _ws_offset = 0
+                    for _ in range(100):  # cap at 100k frames per flow
+                        ws_data = db.get_websocket_messages(row["id"], limit=1000, offset=_ws_offset)
+                        if not ws_data or not ws_data.get("is_websocket"):
+                            ws_data = None
+                            break
+                        ws_msgs_all.extend(ws_data.get("messages") or [])
+                        if not ws_data.get("truncated"):
+                            break
+                        _ws_offset += 1000
+                    else:
+                        print(
+                            f"WS rehydration capped at 100k frames for {row['id']}",
+                            file=sys.stderr,
+                        )
+                    ws_msgs = ws_msgs_all
                     if ws_data and ws_data.get("is_websocket") and ws_msgs:
+                        if ws_data.get("dropped_count") or ws_data.get("truncated_any"):
+                            # Frames dropped by safety-valve caps or stored truncated
+                            # (partial bodies) can't be faithfully exported.
+                            ws_export_warnings.append(str(row["id"]))
                         from mitmproxy.websocket import WebSocketData, WebSocketMessage
 
                         try:
@@ -1376,13 +1403,21 @@ async def export_har(
 
         await asyncio.to_thread(_write)
 
-        return {
+        result: Dict[str, Any] = {
             "status": "ok",
             "path": str(requested_path),
             "entries": len(har["log"]["entries"]),
             "bytes": len(data),
             "filter": {"domain": domain, "limit": limit},
         }
+        if ws_export_warnings:
+            result["warnings"] = [
+                f"WebSocket frames for {len(ws_export_warnings)} flow(s) were "
+                "dropped by safety-valve caps or stored truncated; their HAR "
+                "_webSocketMessages are partial approximations."
+            ]
+            result["ws_partial_flows"] = ws_export_warnings
+        return result
     except Exception as e:
         logger.error("export_har_failed", error=str(e))
         return {"status": "error", "message": str(e)}
@@ -3175,18 +3210,6 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
-def _env_int(name: str, default: int = 0) -> int:
-    """Parse an int env var. Returns default on missing/invalid. 0 = unlimited."""
-    try:
-        raw = os.environ.get(name)
-        if raw is None or str(raw).strip() == "":
-            return default
-        val = int(str(raw).strip())
-        return val if val >= 0 else default
-    except Exception:
-        return default
-
-
 def start():
     """Entry point for running the server directly."""
     import argparse
@@ -3251,8 +3274,16 @@ def start():
     controller.default_host = args.host
     controller.auto_start = args.auto_start
     try:
-        controller.recorder.db.ws_max_messages_per_flow = max(0, int(args.ws_max_messages or 0))
-        controller.recorder.db.ws_max_message_bytes = max(0, int(args.ws_max_bytes or 0))
+        raw_max_msgs = int(args.ws_max_messages or 0)
+        raw_max_bytes = int(args.ws_max_bytes or 0)
+        if raw_max_msgs < 0 or raw_max_bytes < 0:
+            print(
+                "Warning: negative --ws-max-messages/--ws-max-bytes coerced to 0 "
+                "(unlimited). Use 0 for unlimited or a positive cap.",
+                file=sys.stderr,
+            )
+        controller.recorder.db.ws_max_messages_per_flow = max(0, raw_max_msgs)
+        controller.recorder.db.ws_max_message_bytes = max(0, raw_max_bytes)
     except Exception:
         pass
     # Re-wire live flow subscription for the new controller instance

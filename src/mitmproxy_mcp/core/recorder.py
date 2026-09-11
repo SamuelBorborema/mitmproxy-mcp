@@ -67,6 +67,31 @@ def _decode_ws_text(content: bytes) -> Optional[str]:
             return None
 
 
+# Allow-listed direction filters for get_websocket_messages (case-insensitive).
+_WS_CLIENT_DIRECTIONS = frozenset({"client", "send", "c2s", "client->server"})
+_WS_SERVER_DIRECTIONS = frozenset({"server", "receive", "recv", "s2c", "server->client"})
+
+
+def _normalize_ws_direction(direction: Optional[str]) -> Optional[str]:
+    """Normalize a direction filter to 'client', 'server', or None (both).
+
+    Raises ValueError on unknown values so typos can't silently return
+    unfiltered data.
+    """
+    if direction is None:
+        return None
+    key = str(direction).strip().lower()
+    if key in ("", "both", "all"):
+        return None
+    if key in _WS_CLIENT_DIRECTIONS:
+        return "client"
+    if key in _WS_SERVER_DIRECTIONS:
+        return "server"
+    raise ValueError(
+        f"Invalid direction '{direction}'. Use 'client', 'server', or omit for both."
+    )
+
+
 class SimpleRequest:
     def __init__(self, method: str, url: str, headers: Dict[str, str], body: Optional[str]):
         self.method = method
@@ -394,14 +419,30 @@ class TrafficDB:
         }
 
     def _sync_websocket_messages(self, flow: http.HTTPFlow) -> int:
-        """Insert missing WS frames for a flow. Returns number newly stored."""
+        """Insert missing WS frames for a flow. Returns number newly stored.
+
+        Delta strategy: seqs are contiguous (0..n-1) on the live flow object,
+        so frames at seq <= MAX(seq) already stored are skipped without
+        re-encoding. Makes the per-frame hook O(1) amortized instead of O(n²).
+        """
         messages = self._get_ws_messages(flow)
         if not messages:
             return 0
         max_msgs = self.ws_max_messages_per_flow or 0
         newly = 0
         with self._get_conn() as conn:
+            try:
+                cur = conn.execute(
+                    "SELECT MAX(seq) FROM websocket_messages WHERE flow_id=?",
+                    (flow.id,),
+                )
+                max_row = cur.fetchone()
+                start_seq = (int(max_row[0]) + 1) if max_row and max_row[0] is not None else 0
+            except Exception:
+                start_seq = 0
             for seq, msg in enumerate(messages):
+                if seq < start_seq:
+                    continue
                 # Safety valve 1: per-flow message cap (drop newest beyond cap).
                 if max_msgs > 0 and seq >= max_msgs:
                     continue
@@ -433,7 +474,7 @@ class TrafficDB:
                         is_truncated = 1
                     content_b64 = base64.b64encode(stored_content).decode() if stored_content else ""
                     content_text = _decode_ws_text(stored_content)
-                    conn.execute(
+                    cur = conn.execute(
                         """
                         INSERT OR IGNORE INTO websocket_messages (
                             flow_id, seq, from_client, opcode, is_text,
@@ -447,13 +488,12 @@ class TrafficDB:
                             is_truncated, total_bytes, content_hash,
                         ),
                     )
-                    # rowcount==1 means actually inserted (IGNORE skips dupes)
+                    # rowcount==1 on insert, 0 when OR IGNORE skips a dupe.
                     try:
-                        if conn.total_changes is not None:
-                            pass
+                        if cur.rowcount == 1:
+                            newly += 1
                     except Exception:
-                        pass
-                    newly += 1
+                        newly += 1
                 except Exception as e:
                     print(f"Skipped WS message {seq} for {flow.id}: {e}", file=sys.stderr)
                     continue
@@ -484,7 +524,14 @@ class TrafficDB:
         offset: int = 0,
         direction: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Paginated fetch of stored WS frames plus cap accounting."""
+        """Paginated fetch of stored WS frames plus cap accounting.
+
+        Raises ValueError on unknown direction filter values.
+        """
+        try:
+            direction = _normalize_ws_direction(direction)
+        except ValueError:
+            raise
         if limit < 0:
             limit = 0
         if offset < 0:
@@ -527,9 +574,9 @@ class TrafficDB:
                 }
             where = "WHERE flow_id=?"
             params: List[Any] = [flow_id]
-            if direction in ("client", "send", "c2s"):
+            if direction == "client":
                 where += " AND from_client=1"
-            elif direction in ("server", "receive", "recv", "s2c"):
+            elif direction == "server":
                 where += " AND from_client=0"
             try:
                 tcur = conn.execute(f"SELECT COUNT(*) FROM websocket_messages {where}", params)
@@ -638,16 +685,31 @@ class TrafficDB:
             if not row:
                 return None
             if not row["is_websocket"]:
-                # Still check messages table (e.g. row written before migration)
+                # Still check messages table (e.g. row written before migration).
+                # Report the counted values, not the (zero) row columns.
                 try:
                     cur2 = conn.execute(
-                        "SELECT COUNT(*) AS c FROM websocket_messages WHERE flow_id=?",
+                        "SELECT COUNT(*), MAX(is_truncated) FROM websocket_messages WHERE flow_id=?",
                         (flow_id,),
                     )
-                    if int(cur2.fetchone()["c"]) == 0:
+                    cnt_row = cur2.fetchone()
+                    cnt = int(cnt_row[0]) if cnt_row and cnt_row[0] is not None else 0
+                    trunc = int(cnt_row[1]) if cnt_row and len(cnt_row) > 1 and cnt_row[1] else 0
+                    if cnt == 0:
                         return None
                 except Exception:
                     return None
+                return {
+                    "is_websocket": True,
+                    "message_count": cnt,
+                    "stored_count": cnt,
+                    "dropped_count": 0,
+                    "truncated_any": bool(trunc),
+                    "closed_by_client": None,
+                    "close_code": None,
+                    "close_reason": None,
+                    "timestamp_end": None,
+                }
             cbc = row["ws_closed_by_client"]
             return {
                 "is_websocket": True,
@@ -1287,11 +1349,15 @@ class TrafficRecorder:
                 print(f"Failed to save websocket start: {e}", file=sys.stderr)
 
     def websocket_message(self, flow: http.HTTPFlow):
-        """Persist the latest frame. Hook is blocking; never raise."""
+        """Persist the latest frame. Hook is blocking; never raise.
+
+        Note: intentionally does NOT append to the live-flow deque — a busy
+        WS stream would otherwise evict all other flows from get_live_flow()
+        (deque maxlen=500). Start/end hooks still buffer the handshake.
+        """
         if self.scope.is_allowed(flow):
             try:
                 self.db.save_flow(flow)
-                self.flows.append(flow)
                 self._notify()
             except Exception as e:
                 print(f"Failed to save websocket message: {e}", file=sys.stderr)

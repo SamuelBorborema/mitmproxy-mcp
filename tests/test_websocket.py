@@ -320,14 +320,14 @@ def test_scope_filter_drops_ws_frames():
 
 
 @pytest.mark.asyncio
-async def test_har_roundtrip_preserves_ws():
-    from pathlib import Path
-
+async def test_har_roundtrip_preserves_ws(tmp_path, monkeypatch):
     from mitmproxy_mcp.core.server import export_har, load_traffic_file
 
+    # export_har/load_traffic_file require paths under Path.cwd(), so run
+    # inside the isolated tmp dir instead of writing into the repo checkout.
+    monkeypatch.chdir(tmp_path)
     old_db = controller.recorder.db
-    tmp = tempfile.mktemp(suffix=".db", dir=".")
-    controller.recorder.db = TrafficDB(tmp)
+    controller.recorder.db = TrafficDB(str(tmp_path / "ws.db"))
     out = "ws_roundtrip_tmp.har"
     try:
         controller.recorder.clear()
@@ -339,7 +339,8 @@ async def test_har_roundtrip_preserves_ws():
         res = await export_har(out)
         assert res["status"] == "ok"
         assert res["entries"] == 1
-        har = __import__("json").loads(Path(out).read_text())
+        assert "warnings" not in res
+        har = __import__("json").loads((tmp_path / out).read_text())
         entry = har["log"]["entries"][0]
         ws_msgs = entry.get("_webSocketMessages") or []
         assert len(ws_msgs) == 2
@@ -355,9 +356,6 @@ async def test_har_roundtrip_preserves_ws():
         assert len(rows) == 1
     finally:
         controller.recorder.db = old_db
-        for p in (out, tmp):
-            if os.path.exists(p):
-                os.remove(p)
 
 
 def test_ws_env_and_cli_defaults(monkeypatch):
@@ -406,8 +404,11 @@ def test_get_websocket_edge_inputs():
         assert over["limit"] == 1000
         neg = db.get_websocket_messages(flow.id, limit=-1, offset=-5)
         assert neg["messages"] == []
-        unknown_dir = db.get_websocket_messages(flow.id, direction="sideways")
-        assert len(unknown_dir["messages"]) == 2
+        with pytest.raises(ValueError):
+            db.get_websocket_messages(flow.id, direction="sideways")
+        # Aliases are case-insensitive.
+        assert len(db.get_websocket_messages(flow.id, direction="Client")["messages"]) == 1
+        assert len(db.get_websocket_messages(flow.id, direction="SERVER")["messages"]) == 1
         past = db.get_websocket_messages(flow.id, limit=10, offset=99)
         assert past["messages"] == []
         assert past["truncated"] is False
@@ -426,6 +427,51 @@ def test_get_websocket_edge_inputs():
     finally:
         if os.path.exists(path):
             os.remove(path)
+
+
+def test_sync_returns_newly_and_skips_stored():
+    db, path = _make_tmp_db()
+    try:
+        # Save the handshake row first so flow-level queries resolve.
+        flow = _make_ws_flow(messages=[])
+        db.save_flow(flow)
+        flow.websocket.messages.append(WebSocketMessage(Opcode.TEXT, True, b"a"))
+        flow.websocket.messages.append(WebSocketMessage(Opcode.TEXT, False, b"b"))
+        assert db._sync_websocket_messages(flow) == 2
+        # Second sync inserts nothing (delta: MAX(seq) skip + OR IGNORE).
+        assert db._sync_websocket_messages(flow) == 0
+        flow.websocket.messages.append(WebSocketMessage(Opcode.TEXT, True, b"c"))
+        assert db._sync_websocket_messages(flow) == 1
+        assert db.get_websocket_messages(flow.id)["stored"] == 3
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+
+
+@pytest.mark.asyncio
+async def test_tool_rejects_bad_direction_and_export_warns_on_caps(tmp_path, monkeypatch):
+    from mitmproxy_mcp.core.server import export_har, get_websocket_messages as tool
+
+    monkeypatch.chdir(tmp_path)
+    old_db = controller.recorder.db
+    controller.recorder.db = TrafficDB(
+        str(tmp_path / "ws.db"), ws_max_messages_per_flow=1, ws_max_message_bytes=2
+    )
+    try:
+        controller.recorder.clear()
+        flow = _make_ws_flow(messages=[
+            WebSocketMessage(Opcode.TEXT, True, b"hello"),
+            WebSocketMessage(Opcode.TEXT, False, b"world"),
+        ])
+        controller.recorder.db.save_flow(flow)
+        err = await tool(flow.id, direction="sideways")
+        assert "error" in err
+        res = await export_har("ws_capped.har")
+        assert res["status"] == "ok"
+        assert "warnings" in res
+        assert res["ws_partial_flows"] == [flow.id]
+    finally:
+        controller.recorder.db = old_db
 
 
 def test_empty_and_nonutf8_binary_frames():
