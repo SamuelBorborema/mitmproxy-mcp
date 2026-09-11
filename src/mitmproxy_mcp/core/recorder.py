@@ -42,6 +42,31 @@ def _parse_headers_ordered(raw: str) -> List[List[str]]:
     return [[k, v] for k, v in parsed.items()]
 
 
+def _env_int(name: str, default: int = 0) -> int:
+    """Parse an int env var. Returns default on missing/invalid. 0 = unlimited."""
+    try:
+        raw = os.environ.get(name)
+        if raw is None or str(raw).strip() == "":
+            return default
+        val = int(str(raw).strip())
+        return val if val >= 0 else default
+    except Exception:
+        return default
+
+
+def _decode_ws_text(content: bytes) -> Optional[str]:
+    """Best-effort decode of WS frame bytes for search/display."""
+    if content is None:
+        return None
+    try:
+        return content.decode("utf-8")
+    except Exception:
+        try:
+            return content.decode("utf-8", errors="replace")
+        except Exception:
+            return None
+
+
 class SimpleRequest:
     def __init__(self, method: str, url: str, headers: Dict[str, str], body: Optional[str]):
         self.method = method
@@ -65,8 +90,26 @@ class SimpleResponse:
 class TrafficDB:
     """Implements SQLite persistence for traffic logs."""
 
-    def __init__(self, db_path: str = "mitm_mcp_traffic.db"):
+    def __init__(
+        self,
+        db_path: str = "mitm_mcp_traffic.db",
+        ws_max_messages_per_flow: Optional[int] = None,
+        ws_max_message_bytes: Optional[int] = None,
+    ):
         self.db_path = db_path
+        # Safety valve: 0 = unlimited (default, "store everything").
+        # Overridable via env MITM_WS_MAX_MESSAGES_PER_FLOW /
+        # MITM_WS_MAX_MESSAGE_BYTES or explicit constructor args / CLI flags.
+        self.ws_max_messages_per_flow = (
+            ws_max_messages_per_flow
+            if ws_max_messages_per_flow is not None
+            else _env_int("MITM_WS_MAX_MESSAGES_PER_FLOW", 0)
+        )
+        self.ws_max_message_bytes = (
+            ws_max_message_bytes
+            if ws_max_message_bytes is not None
+            else _env_int("MITM_WS_MAX_MESSAGE_BYTES", 0)
+        )
         self._init_db()
 
     def _get_conn(self):
@@ -107,6 +150,15 @@ class TrafficDB:
                 ("response_raw", "ALTER TABLE flows ADD COLUMN response_raw TEXT"),
                 ("request_hash", "ALTER TABLE flows ADD COLUMN request_hash TEXT"),
                 ("response_hash", "ALTER TABLE flows ADD COLUMN response_hash TEXT"),
+                ("is_websocket", "ALTER TABLE flows ADD COLUMN is_websocket INTEGER DEFAULT 0"),
+                ("ws_message_count", "ALTER TABLE flows ADD COLUMN ws_message_count INTEGER DEFAULT 0"),
+                ("ws_stored_count", "ALTER TABLE flows ADD COLUMN ws_stored_count INTEGER DEFAULT 0"),
+                ("ws_dropped_count", "ALTER TABLE flows ADD COLUMN ws_dropped_count INTEGER DEFAULT 0"),
+                ("ws_closed_by_client", "ALTER TABLE flows ADD COLUMN ws_closed_by_client INTEGER"),
+                ("ws_close_code", "ALTER TABLE flows ADD COLUMN ws_close_code INTEGER"),
+                ("ws_close_reason", "ALTER TABLE flows ADD COLUMN ws_close_reason TEXT"),
+                ("ws_timestamp_end", "ALTER TABLE flows ADD COLUMN ws_timestamp_end REAL"),
+                ("ws_truncated_any", "ALTER TABLE flows ADD COLUMN ws_truncated_any INTEGER DEFAULT 0"),
             ]
             for col, stmt in alter_stmts:
                 if col not in existing_cols:
@@ -116,11 +168,29 @@ class TrafficDB:
                         if "duplicate column name" in str(e).lower() or "already exists" in str(e).lower():
                             continue
                         raise
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS websocket_messages (
+                    flow_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    from_client INTEGER NOT NULL,
+                    opcode INTEGER NOT NULL,
+                    is_text INTEGER NOT NULL,
+                    content_b64 TEXT,
+                    content_text TEXT,
+                    timestamp REAL,
+                    is_truncated INTEGER DEFAULT 0,
+                    total_bytes INTEGER DEFAULT 0,
+                    content_hash TEXT,
+                    PRIMARY KEY (flow_id, seq)
+                )
+            """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON flows(timestamp)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_url ON flows(url)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_method ON flows(method)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON flows(status_code)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_size ON flows(size)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ws_flow ON websocket_messages(flow_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_is_websocket ON flows(is_websocket)")
 
     def save_flow(self, flow: http.HTTPFlow):
         """Upserts a flow into the database."""
@@ -163,6 +233,8 @@ class TrafficDB:
         req_hash = hashlib.sha256(req_raw_bytes).hexdigest() if req_raw_bytes is not None else None
         resp_hash = hashlib.sha256(resp_raw_bytes).hexdigest() if resp_raw_bytes is not None else None
 
+        ws_meta = self._extract_ws_meta(flow)
+
         with self._get_conn() as conn:
             conn.execute(
                 """
@@ -172,8 +244,11 @@ class TrafficDB:
                     response_headers, response_body,
                     timestamp, size,
                     duration, request_raw, response_raw,
-                    request_hash, response_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    request_hash, response_hash,
+                    is_websocket, ws_message_count, ws_stored_count,
+                    ws_dropped_count, ws_closed_by_client, ws_close_code,
+                    ws_close_reason, ws_timestamp_end, ws_truncated_any
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     url=excluded.url,
                     method=excluded.method,
@@ -187,7 +262,16 @@ class TrafficDB:
                     request_raw=excluded.request_raw,
                     response_raw=excluded.response_raw,
                     request_hash=excluded.request_hash,
-                    response_hash=excluded.response_hash
+                    response_hash=excluded.response_hash,
+                    is_websocket=excluded.is_websocket,
+                    ws_message_count=excluded.ws_message_count,
+                    ws_stored_count=excluded.ws_stored_count,
+                    ws_dropped_count=excluded.ws_dropped_count,
+                    ws_closed_by_client=excluded.ws_closed_by_client,
+                    ws_close_code=excluded.ws_close_code,
+                    ws_close_reason=excluded.ws_close_reason,
+                    ws_timestamp_end=excluded.ws_timestamp_end,
+                    ws_truncated_any=excluded.ws_truncated_any
             """,
                 (
                     flow.id,
@@ -217,8 +301,365 @@ class TrafficDB:
                     resp_raw_b64,
                     req_hash,
                     resp_hash,
+                    ws_meta["is_websocket"],
+                    ws_meta["ws_message_count"],
+                    ws_meta["ws_stored_count"],
+                    ws_meta["ws_dropped_count"],
+                    ws_meta["ws_closed_by_client"],
+                    ws_meta["ws_close_code"],
+                    ws_meta["ws_close_reason"],
+                    ws_meta["ws_timestamp_end"],
+                    ws_meta["ws_truncated_any"],
                 ),
             )
+
+        # Persist frame bodies (outside the flows upsert transaction so a
+        # huge burst of frames can't roll back the handshake row).
+        try:
+            self._sync_websocket_messages(flow)
+        except Exception as e:
+            print(f"Failed to save websocket messages for {flow.id}: {e}", file=sys.stderr)
+
+    @staticmethod
+    def _get_ws_messages(flow) -> List[Any]:
+        """Return flow.websocket.messages or [] without raising."""
+        try:
+            ws = getattr(flow, "websocket", None)
+            if ws is None:
+                return []
+            msgs = getattr(ws, "messages", None)
+            return list(msgs) if msgs else []
+        except Exception:
+            return []
+
+    def _extract_ws_meta(self, flow: http.HTTPFlow) -> Dict[str, Any]:
+        """Compute WS columns for the flows row (observed totals + cap accounting)."""
+        try:
+            ws = getattr(flow, "websocket", None)
+        except Exception:
+            ws = None
+        if ws is None:
+            return {
+                "is_websocket": 0,
+                "ws_message_count": 0,
+                "ws_stored_count": 0,
+                "ws_dropped_count": 0,
+                "ws_closed_by_client": None,
+                "ws_close_code": None,
+                "ws_close_reason": None,
+                "ws_timestamp_end": None,
+                "ws_truncated_any": 0,
+            }
+        try:
+            messages = list(getattr(ws, "messages", []) or [])
+        except Exception:
+            messages = []
+        total = len(messages)
+        max_msgs = self.ws_max_messages_per_flow or 0
+        if max_msgs > 0 and total > max_msgs:
+            stored = max_msgs
+            dropped = total - max_msgs
+        else:
+            stored = total
+            dropped = 0
+        # Truncation flag: true if any stored frame would exceed per-message cap.
+        truncated_any = 0
+        max_bytes = self.ws_max_message_bytes or 0
+        if max_bytes > 0:
+            try:
+                for m in messages[: stored if stored else 0]:
+                    c = getattr(m, "content", b"") or b""
+                    if len(c) > max_bytes:
+                        truncated_any = 1
+                        break
+            except Exception:
+                pass
+        closed_by_client = getattr(ws, "closed_by_client", None)
+        if closed_by_client is True:
+            closed_int: Optional[int] = 1
+        elif closed_by_client is False:
+            closed_int = 0
+        else:
+            closed_int = None
+        return {
+            "is_websocket": 1,
+            "ws_message_count": total,
+            "ws_stored_count": stored,
+            "ws_dropped_count": dropped,
+            "ws_closed_by_client": closed_int,
+            "ws_close_code": getattr(ws, "close_code", None),
+            "ws_close_reason": getattr(ws, "close_reason", None),
+            "ws_timestamp_end": getattr(ws, "timestamp_end", None),
+            "ws_truncated_any": truncated_any,
+        }
+
+    def _sync_websocket_messages(self, flow: http.HTTPFlow) -> int:
+        """Insert missing WS frames for a flow. Returns number newly stored."""
+        messages = self._get_ws_messages(flow)
+        if not messages:
+            return 0
+        max_msgs = self.ws_max_messages_per_flow or 0
+        newly = 0
+        with self._get_conn() as conn:
+            for seq, msg in enumerate(messages):
+                # Safety valve 1: per-flow message cap (drop newest beyond cap).
+                if max_msgs > 0 and seq >= max_msgs:
+                    continue
+                try:
+                    from_client = 1 if getattr(msg, "from_client", False) else 0
+                    # Opcode: 1=TEXT, 2=BINARY (wsproto). Fall back to is_text.
+                    try:
+                        opcode = int(getattr(getattr(msg, "type", None), "value", 1))
+                    except Exception:
+                        opcode = 1 if getattr(msg, "is_text", True) else 2
+                    is_text = 1 if getattr(msg, "is_text", opcode == 1) else 0
+                    content: bytes = getattr(msg, "content", b"") or b""
+                    if not isinstance(content, (bytes, bytearray)):
+                        content = str(content).encode("utf-8", "replace")
+                    else:
+                        content = bytes(content)
+                    total_bytes = len(content)
+                    content_hash = hashlib.sha256(content).hexdigest()
+                    try:
+                        ts = float(getattr(msg, "timestamp", 0.0) or 0.0)
+                    except Exception:
+                        ts = 0.0
+                    # Safety valve 2: per-message byte cap (truncate, keep hash).
+                    is_truncated = 0
+                    stored_content = content
+                    max_bytes = self.ws_max_message_bytes or 0
+                    if max_bytes > 0 and len(content) > max_bytes:
+                        stored_content = content[:max_bytes]
+                        is_truncated = 1
+                    content_b64 = base64.b64encode(stored_content).decode() if stored_content else ""
+                    content_text = _decode_ws_text(stored_content)
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO websocket_messages (
+                            flow_id, seq, from_client, opcode, is_text,
+                            content_b64, content_text, timestamp,
+                            is_truncated, total_bytes, content_hash
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            flow.id, seq, from_client, opcode, is_text,
+                            content_b64, content_text, ts,
+                            is_truncated, total_bytes, content_hash,
+                        ),
+                    )
+                    # rowcount==1 means actually inserted (IGNORE skips dupes)
+                    try:
+                        if conn.total_changes is not None:
+                            pass
+                    except Exception:
+                        pass
+                    newly += 1
+                except Exception as e:
+                    print(f"Skipped WS message {seq} for {flow.id}: {e}", file=sys.stderr)
+                    continue
+            # Refresh stored/dropped/truncated counters from ground truth.
+            try:
+                total = len(messages)
+                cur = conn.execute(
+                    "SELECT COUNT(*), MAX(is_truncated) FROM websocket_messages WHERE flow_id=?",
+                    (flow.id,),
+                )
+                row = cur.fetchone()
+                stored = int(row[0]) if row and row[0] is not None else 0
+                trunc_any = int(row[1]) if row and len(row) > 1 and row[1] is not None else 0
+                dropped = max(0, total - stored) if (self.ws_max_messages_per_flow or 0) > 0 else 0
+                conn.execute(
+                    """UPDATE flows SET ws_message_count=?, ws_stored_count=?,
+                       ws_dropped_count=?, ws_truncated_any=? WHERE id=?""",
+                    (total, stored, dropped, trunc_any, flow.id),
+                )
+            except Exception:
+                pass
+        return newly
+
+    def get_websocket_messages(
+        self,
+        flow_id: str,
+        limit: int = 100,
+        offset: int = 0,
+        direction: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Paginated fetch of stored WS frames plus cap accounting."""
+        if limit < 0:
+            limit = 0
+        if offset < 0:
+            offset = 0
+        if limit > 1000:
+            limit = 1000
+        with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            try:
+                fcur = conn.execute(
+                    """SELECT id, url, is_websocket, ws_message_count, ws_stored_count,
+                       ws_dropped_count, ws_closed_by_client, ws_close_code,
+                       ws_close_reason, ws_timestamp_end, ws_truncated_any
+                       FROM flows WHERE id=?""",
+                    (flow_id,),
+                )
+            except sqlite3.OperationalError:
+                # Old DB without WS columns
+                fcur = conn.execute("SELECT id, url FROM flows WHERE id=?", (flow_id,))
+            frow = fcur.fetchone()
+            if not frow:
+                return None
+            keys = set(frow.keys())
+            is_ws = int(frow["is_websocket"]) if "is_websocket" in keys and frow["is_websocket"] is not None else 0
+            # Fall back to message-table existence for old rows / old DBs.
+            mcount_cur = conn.execute(
+                "SELECT COUNT(*) FROM websocket_messages WHERE flow_id=?", (flow_id,)
+            )
+            stored_total = int(mcount_cur.fetchone()[0])
+            if not is_ws and stored_total == 0:
+                return {
+                    "flow_id": flow_id,
+                    "url": frow["url"] if "url" in keys else "",
+                    "is_websocket": False,
+                    "total_observed": 0,
+                    "stored": 0,
+                    "dropped_count": 0,
+                    "truncated_any": False,
+                    "messages": [],
+                }
+            where = "WHERE flow_id=?"
+            params: List[Any] = [flow_id]
+            if direction in ("client", "send", "c2s"):
+                where += " AND from_client=1"
+            elif direction in ("server", "receive", "recv", "s2c"):
+                where += " AND from_client=0"
+            try:
+                tcur = conn.execute(f"SELECT COUNT(*) FROM websocket_messages {where}", params)
+                filtered_total = int(tcur.fetchone()[0])
+            except Exception:
+                filtered_total = stored_total
+            cur = conn.execute(
+                f"""SELECT seq, from_client, opcode, is_text, content_b64, content_text,
+                    timestamp, is_truncated, total_bytes, content_hash
+                    FROM websocket_messages {where} ORDER BY seq ASC LIMIT ? OFFSET ?""",
+                (*params, limit, offset),
+            )
+            msgs = []
+            for r in cur.fetchall():
+                fc = int(r["from_client"])
+                msgs.append(
+                    {
+                        "seq": int(r["seq"]),
+                        "direction": "client->server" if fc == 1 else "server->client",
+                        "from_client": bool(fc),
+                        "opcode": int(r["opcode"]),
+                        "type": "text" if int(r["is_text"]) == 1 else "binary",
+                        "is_text": bool(int(r["is_text"])),
+                        "timestamp": r["timestamp"],
+                        "is_truncated": bool(int(r["is_truncated"] or 0)),
+                        "total_bytes": int(r["total_bytes"] or 0),
+                        "content_hash": r["content_hash"],
+                        "text": r["content_text"],
+                        "content_b64": r["content_b64"],
+                    }
+                )
+            def _col(name: str, default: Any = None) -> Any:
+                return frow[name] if name in keys else default
+
+            observed = _col("ws_message_count", stored_total)
+            try:
+                observed = int(observed) if observed is not None else stored_total
+            except Exception:
+                observed = stored_total
+            dropped = _col("ws_dropped_count", max(0, observed - stored_total))
+            try:
+                dropped = int(dropped) if dropped is not None else 0
+            except Exception:
+                dropped = 0
+            cbc = _col("ws_closed_by_client", None)
+            return {
+                "flow_id": flow_id,
+                "url": _col("url", ""),
+                "is_websocket": True,
+                "total_observed": observed,
+                "stored": stored_total,
+                "filtered_total": filtered_total,
+                "dropped_count": dropped,
+                "truncated_any": bool(_col("ws_truncated_any", 0) or 0),
+                "closed_by_client": (bool(cbc) if cbc is not None else None),
+                "close_code": _col("ws_close_code", None),
+                "close_reason": _col("ws_close_reason", None),
+                "timestamp_end": _col("ws_timestamp_end", None),
+                "limits": {
+                    "max_messages_per_flow": self.ws_max_messages_per_flow or 0,
+                    "max_message_bytes": self.ws_max_message_bytes or 0,
+                },
+                "offset": offset,
+                "limit": limit,
+                "truncated": (offset + limit) < filtered_total,
+                "next_offset": (offset + limit) if (offset + limit) < filtered_total else None,
+                "messages": msgs,
+            }
+
+    def get_websocket_summary(self, flow_id: str) -> Optional[Dict[str, Any]]:
+        """Lightweight WS header for inspect_flow without frame bodies."""
+        with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            try:
+                cur = conn.execute(
+                    """SELECT is_websocket, ws_message_count, ws_stored_count,
+                       ws_dropped_count, ws_closed_by_client, ws_close_code,
+                       ws_close_reason, ws_timestamp_end, ws_truncated_any
+                       FROM flows WHERE id=?""",
+                    (flow_id,),
+                )
+                row = cur.fetchone()
+            except sqlite3.OperationalError:
+                # Old DB: infer from messages table
+                try:
+                    cur = conn.execute(
+                        "SELECT COUNT(*) AS c FROM websocket_messages WHERE flow_id=?",
+                        (flow_id,),
+                    )
+                    c = int(cur.fetchone()["c"])
+                except Exception:
+                    return None
+                if c == 0:
+                    return None
+                return {
+                    "is_websocket": True,
+                    "message_count": c,
+                    "stored_count": c,
+                    "dropped_count": 0,
+                    "truncated_any": False,
+                    "closed_by_client": None,
+                    "close_code": None,
+                    "close_reason": None,
+                    "timestamp_end": None,
+                }
+            if not row:
+                return None
+            if not row["is_websocket"]:
+                # Still check messages table (e.g. row written before migration)
+                try:
+                    cur2 = conn.execute(
+                        "SELECT COUNT(*) AS c FROM websocket_messages WHERE flow_id=?",
+                        (flow_id,),
+                    )
+                    if int(cur2.fetchone()["c"]) == 0:
+                        return None
+                except Exception:
+                    return None
+            cbc = row["ws_closed_by_client"]
+            return {
+                "is_websocket": True,
+                "message_count": int(row["ws_message_count"] or 0),
+                "stored_count": int(row["ws_stored_count"] or 0),
+                "dropped_count": int(row["ws_dropped_count"] or 0),
+                "truncated_any": bool(row["ws_truncated_any"] or 0),
+                "closed_by_client": (bool(cbc) if cbc is not None else None),
+                "close_code": row["ws_close_code"],
+                "close_reason": row["ws_close_reason"],
+                "timestamp_end": row["ws_timestamp_end"],
+            }
 
     def get_summary(
         self,
@@ -227,10 +668,19 @@ class TrafficDB:
     ) -> List[Dict[str, Any]]:
         with self._get_conn() as conn:
             conn.row_factory = sqlite3.Row
+            # Tolerate old DBs without WS columns.
+            try:
+                cur_cols = conn.execute("PRAGMA table_info(flows)")
+                flow_cols = {r[1] for r in cur_cols.fetchall()}
+            except Exception:
+                flow_cols = set()
+            ws_select = ""
+            if {"is_websocket", "ws_message_count", "ws_stored_count", "ws_dropped_count"}.issubset(flow_cols):
+                ws_select = ", is_websocket, ws_message_count, ws_stored_count, ws_dropped_count"
             cursor = conn.execute(
-                """
+                f"""
                 SELECT id, url, method, status_code,
-                       response_headers, timestamp, size
+                       response_headers, timestamp, size{ws_select}
                 FROM flows
                 ORDER BY timestamp DESC
                 LIMIT ? OFFSET ?
@@ -249,17 +699,24 @@ class TrafficDB:
                         headers.get("Content-Type", "unknown"),
                     )
 
-                result.append(
-                    {
-                        "id": row["id"],
-                        "url": row["url"],
-                        "method": row["method"],
-                        "status_code": row["status_code"],
-                        "content_type": content_type,
-                        "size": row["size"],
-                        "timestamp": row["timestamp"],
-                    }
-                )
+                entry: Dict[str, Any] = {
+                    "id": row["id"],
+                    "url": row["url"],
+                    "method": row["method"],
+                    "status_code": row["status_code"],
+                    "content_type": content_type,
+                    "size": row["size"],
+                    "timestamp": row["timestamp"],
+                }
+                keys = set(row.keys())
+                if "is_websocket" in keys:
+                    is_ws = bool(row["is_websocket"] or 0)
+                    entry["is_websocket"] = is_ws
+                    if is_ws:
+                        entry["ws_message_count"] = int(row["ws_message_count"] or 0)
+                        entry["ws_stored_count"] = int(row["ws_stored_count"] or 0)
+                        entry["ws_dropped_count"] = int(row["ws_dropped_count"] or 0)
+                result.append(entry)
             return result
 
     def get_detail(self, flow_id: str) -> Optional[Dict[str, Any]]:
@@ -290,7 +747,7 @@ class TrafficDB:
                 else None
             )
 
-            return {
+            detail: Dict[str, Any] = {
                 "id": row["id"],
                 "request": {
                     "method": simple_request.method,
@@ -307,6 +764,15 @@ class TrafficDB:
                 else None,
                 "curl_command": self._generate_curl(simple_request),
             }
+            # Attach WS summary when present (no frame bodies here; use
+            # get_websocket_messages for paginated frames).
+            try:
+                ws_summary = self.get_websocket_summary(row["id"])
+                if ws_summary is not None:
+                    detail["websocket"] = ws_summary
+            except Exception:
+                pass
+            return detail
 
     def search(
         self, query: str = None, domain: str = None, method: str = None, limit: int = 50
@@ -323,20 +789,38 @@ class TrafficDB:
             params.append(method.upper())
 
         if query:
-            sql += " AND (url LIKE ? OR request_body LIKE ? OR response_body LIKE ?)"
+            sql += (
+                " AND (url LIKE ? OR request_body LIKE ? OR response_body LIKE ?"
+                " OR id IN (SELECT flow_id FROM websocket_messages WHERE content_text LIKE ?))"
+            )
             wildcard = f"%{query}%"
-            params.extend([wildcard, wildcard, wildcard])
+            params.extend([wildcard, wildcard, wildcard, wildcard])
 
         sql += " ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)
 
         with self._get_conn() as conn:
             conn.row_factory = sqlite3.Row
-            cursor = conn.execute(sql, params)
-            return [dict(row) for row in cursor.fetchall()]
+            try:
+                cursor = conn.execute(sql, params)
+                return [dict(row) for row in cursor.fetchall()]
+            except sqlite3.OperationalError as e:
+                # Old DB without websocket_messages table
+                if "websocket_messages" in str(e):
+                    sql_fb = sql.replace(
+                        " OR id IN (SELECT flow_id FROM websocket_messages WHERE content_text LIKE ?)",
+                        "",
+                    )
+                    params_fb = params[:-2] + params[-1:] if len(params) >= 2 else params
+                    # params_fb: drop the ws wildcard (4th), keep limit
+                    # Rebuild correctly: [domain?, method?, url, req, resp, limit]
+                    cursor = conn.execute(sql_fb, params_fb)
+                    return [dict(row) for row in cursor.fetchall()]
+                raise
 
     def clear(self):
         with self._get_conn() as conn:
+            conn.execute("DELETE FROM websocket_messages")
             conn.execute("DELETE FROM flows")
 
     def _has_duration_column(self) -> bool:
@@ -514,9 +998,12 @@ class TrafficDB:
 
         if columns:
             allowed_cols = {
-                "id", "url", "method", "status_code", "request_headers", 
+                "id", "url", "method", "status_code", "request_headers",
                 "request_body", "response_headers", "response_body", "timestamp", "size",
-                "duration", "request_raw", "response_raw", "request_hash", "response_hash"
+                "duration", "request_raw", "response_raw", "request_hash", "response_hash",
+                "is_websocket", "ws_message_count", "ws_stored_count",
+                "ws_dropped_count", "ws_closed_by_client", "ws_close_code",
+                "ws_close_reason", "ws_timestamp_end", "ws_truncated_any",
             }
             invalid_cols = [c for c in columns if c not in allowed_cols]
             if invalid_cols:
@@ -789,6 +1276,36 @@ class TrafficRecorder:
             except Exception as e:
                 print(f"Failed to save flow error: {e}", file=sys.stderr)
 
+    def websocket_start(self, flow: http.HTTPFlow):
+        """Handshake completed (101). Ensure the flow row exists as WS."""
+        if self.scope.is_allowed(flow):
+            try:
+                self.db.save_flow(flow)
+                self.flows.append(flow)
+                self._notify()
+            except Exception as e:
+                print(f"Failed to save websocket start: {e}", file=sys.stderr)
+
+    def websocket_message(self, flow: http.HTTPFlow):
+        """Persist the latest frame. Hook is blocking; never raise."""
+        if self.scope.is_allowed(flow):
+            try:
+                self.db.save_flow(flow)
+                self.flows.append(flow)
+                self._notify()
+            except Exception as e:
+                print(f"Failed to save websocket message: {e}", file=sys.stderr)
+
+    def websocket_end(self, flow: http.HTTPFlow):
+        """Persist close metadata (close_code / closed_by_client / timestamp_end)."""
+        if self.scope.is_allowed(flow):
+            try:
+                self.db.save_flow(flow)
+                self.flows.append(flow)
+                self._notify()
+            except Exception as e:
+                print(f"Failed to save websocket end: {e}", file=sys.stderr)
+
     def get_flow_summary(self, limit: int = 10) -> List[Dict[str, Any]]:
         return self.db.get_summary(limit=limit)
 
@@ -807,6 +1324,18 @@ class TrafficRecorder:
 
     def clear(self):
         self.db.clear()
+
+    def get_websocket_messages(
+        self,
+        flow_id: str,
+        limit: int = 100,
+        offset: int = 0,
+        direction: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        return self.db.get_websocket_messages(flow_id, limit=limit, offset=offset, direction=direction)
+
+    def get_websocket_summary(self, flow_id: str) -> Optional[Dict[str, Any]]:
+        return self.db.get_websocket_summary(flow_id)
 
     def get_all_for_analysis(
         self, limit: Optional[int] = None, lightweight: bool = False

@@ -823,6 +823,46 @@ async def get_response_body(flow_id: str, offset: int = 0, limit: int = 1_000_00
     }
 
 
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+async def get_websocket_messages(
+    flow_id: str,
+    limit: int = 100,
+    offset: int = 0,
+    direction: str = None,
+) -> Dict[str, Any]:
+    """Get stored WebSocket frames for a flow with paginated access.
+
+    Frames are captured via websocket_message/end hooks including full
+    TEXT bodies and base64 BINARY bodies (subject to safety-valve caps).
+
+    Args:
+        flow_id: The ID of the captured WebSocket flow (101 handshake).
+        limit: Max frames to return (default 100, max 1000). Paginate via offset.
+        offset: Frame offset to start from (default 0, ordered by seq ASC).
+        direction: Optional filter: "client" (client->server) or "server"
+            (server->client). Omit for both directions.
+
+    Returns:
+        Dict with flow_id, is_websocket, total_observed, stored,
+        dropped_count, truncated_any, close metadata, limits, offset/limit,
+        truncated, next_offset, messages[].
+        Each message has seq, direction, type (text/binary), timestamp,
+        text (decoded) / content_b64, is_truncated, total_bytes, content_hash.
+    """
+    if limit < 0:
+        limit = 0
+    if offset < 0:
+        offset = 0
+    data = controller.recorder.db.get_websocket_messages(
+        flow_id, limit=limit, offset=offset, direction=direction
+    )
+    if data is None:
+        return {"error": "Couldn't find that flow.", "flow_id": flow_id}
+    if not data.get("is_websocket"):
+        return {"error": "Flow is not a WebSocket flow (no frames stored).", "flow_id": flow_id}
+    return data
+
+
 @mcp.resource("flows://{id}/request_body", mime_type="application/octet-stream")
 def flow_request_body_resource(id: str) -> str | bytes:
     """Resource for full request body: flows://{id}/request_body
@@ -1267,6 +1307,55 @@ async def export_har(
                     flow.id = row["id"]
                 except Exception:
                     pass
+                # Rehydrate WebSocket frames so SaveHar emits _webSocketMessages.
+                try:
+                    ws_data = db.get_websocket_messages(row["id"], limit=10000, offset=0)
+                    ws_msgs = (ws_data.get("messages") or []) if ws_data else []
+                    if ws_data and ws_data.get("is_websocket") and ws_msgs:
+                        from mitmproxy.websocket import WebSocketData, WebSocketMessage
+
+                        try:
+                            from wsproto.frame_protocol import Opcode as _Opcode
+                        except Exception:
+                            _Opcode = None
+                        ws_obj = WebSocketData()
+                        for m in ws_msgs:
+                            try:
+                                raw_b = base64.b64decode(m.get("content_b64") or "")
+                            except Exception:
+                                raw_b = (m.get("text") or "").encode("utf-8", "replace")
+                            is_text = bool(m.get("is_text", m.get("type") == "text"))
+                            if _Opcode is not None:
+                                opcode = _Opcode.TEXT if is_text else _Opcode.BINARY
+                            else:
+                                opcode = 1 if is_text else 2
+                            try:
+                                wmsg = WebSocketMessage(
+                                    opcode, bool(m.get("from_client")), raw_b
+                                )
+                            except Exception:
+                                continue
+                            try:
+                                if m.get("timestamp"):
+                                    wmsg.timestamp = float(m["timestamp"])
+                            except Exception:
+                                pass
+                            ws_obj.messages.append(wmsg)
+                        try:
+                            if ws_data.get("close_code") is not None:
+                                ws_obj.close_code = ws_data["close_code"]
+                            cbc = ws_data.get("closed_by_client")
+                            if cbc is not None:
+                                ws_obj.closed_by_client = bool(cbc)
+                            if ws_data.get("close_reason") is not None:
+                                ws_obj.close_reason = ws_data["close_reason"]
+                            if ws_data.get("timestamp_end") is not None:
+                                ws_obj.timestamp_end = ws_data["timestamp_end"]
+                        except Exception:
+                            pass
+                        flow.websocket = ws_obj
+                except Exception as e:
+                    print(f"Skipping WS rehydration for {row['id']}: {e}", file=sys.stderr)
                 flows.append(flow)
             except Exception as e:
                 # Skip problematic flow but log
@@ -1823,6 +1912,22 @@ async def proxy_status() -> dict[str, Any]:
     except Exception:
         flow_count = 0
 
+    try:
+        with controller.recorder.db._get_conn() as conn:
+            wcur = conn.execute("SELECT COUNT(*) FROM flows WHERE is_websocket=1")
+            wrow = wcur.fetchone()
+            websocket_flow_count = int(wrow[0]) if wrow else 0
+    except Exception:
+        websocket_flow_count = 0
+
+    try:
+        with controller.recorder.db._get_conn() as conn:
+            mcur = conn.execute("SELECT COUNT(*) FROM websocket_messages")
+            mrow = mcur.fetchone()
+            websocket_message_count = int(mrow[0]) if mrow else 0
+    except Exception:
+        websocket_message_count = 0
+
     db_path = getattr(controller.recorder.db, "db_path", "mitm_mcp_traffic.db")
     try:
         if os.path.exists(db_path):
@@ -1842,6 +1947,12 @@ async def proxy_status() -> dict[str, Any]:
         "port": port,
         "uptime_seconds": uptime_seconds,
         "flow_count": flow_count,
+        "websocket_flow_count": websocket_flow_count,
+        "websocket_message_count": websocket_message_count,
+        "ws_limits": {
+            "max_messages_per_flow": getattr(controller.recorder.db, "ws_max_messages_per_flow", 0) or 0,
+            "max_message_bytes": getattr(controller.recorder.db, "ws_max_message_bytes", 0) or 0,
+        },
         "db_path": str(db_path),
         "db_size_bytes": db_size_bytes,
         "active_rules_count": len(controller.interceptor.rules),
@@ -3064,6 +3175,18 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_int(name: str, default: int = 0) -> int:
+    """Parse an int env var. Returns default on missing/invalid. 0 = unlimited."""
+    try:
+        raw = os.environ.get(name)
+        if raw is None or str(raw).strip() == "":
+            return default
+        val = int(str(raw).strip())
+        return val if val >= 0 else default
+    except Exception:
+        return default
+
+
 def start():
     """Entry point for running the server directly."""
     import argparse
@@ -3101,6 +3224,22 @@ def start():
         help="Start the proxy immediately on server startup instead of waiting "
         "for the start_proxy tool. Can also be set via MITMPROXY_AUTO_START env var.",
     )
+    parser.add_argument(
+        "--ws-max-messages",
+        type=int,
+        default=_env_int("MITM_WS_MAX_MESSAGES_PER_FLOW", 0),
+        help="Safety valve: max WebSocket frames stored per flow (0 = unlimited, "
+        "default 0). Beyond the cap, frames are counted as dropped. "
+        "Can also be set via MITM_WS_MAX_MESSAGES_PER_FLOW env var.",
+    )
+    parser.add_argument(
+        "--ws-max-bytes",
+        type=int,
+        default=_env_int("MITM_WS_MAX_MESSAGE_BYTES", 0),
+        help="Safety valve: max bytes stored per WebSocket frame (0 = unlimited, "
+        "default 0). Larger frames are truncated (hash of full frame kept). "
+        "Can also be set via MITM_WS_MAX_MESSAGE_BYTES env var.",
+    )
     args, _ = parser.parse_known_args()
 
     global controller
@@ -3111,6 +3250,11 @@ def start():
     controller.default_port = args.port
     controller.default_host = args.host
     controller.auto_start = args.auto_start
+    try:
+        controller.recorder.db.ws_max_messages_per_flow = max(0, int(args.ws_max_messages or 0))
+        controller.recorder.db.ws_max_message_bytes = max(0, int(args.ws_max_bytes or 0))
+    except Exception:
+        pass
     # Re-wire live flow subscription for the new controller instance
     controller.recorder.on_flow = _notify_live_flow
 
