@@ -115,10 +115,13 @@ pip install git+https://github.com/SamuelBorborema/mitmproxy-mcp
 
 ### Inspection
 
-* `get_traffic_summary(limit=20)`: Returns a list of recent network flows.
-* `inspect_flow(flow_id)`: Provides full details and a `curl` equivalent for a specific flow.
-* `search_traffic(query, domain, method, limit=50)`: Filter captured traffic by keyword/domain/method.
-* `clear_traffic()`: Clears persisted traffic history.
+* `get_traffic_summary(limit=20)`: Returns a list of recent network flows. WebSocket handshakes are flagged with `is_websocket` + frame counts.
+* `inspect_flow(flow_id)`: Provides full details and a `curl` equivalent for a specific flow. WebSocket flows include a `websocket` summary (counts, close metadata); use `get_websocket_messages` for frame bodies.
+* `get_websocket_messages(flow_id, limit=100, offset=0, direction=None)`: Paginated WebSocket frames (`direction`: `client`, `server`, or omitted for both). TEXT bodies decoded, BINARY as base64 with `content_hash`.
+* `search_traffic(query, domain, method, limit=50)`: Filter captured traffic by keyword/domain/method. Also matches WebSocket frame text.
+* `clear_traffic()`: Clears persisted traffic history (including WebSocket frames).
+
+> **WebSocket notes:** frame storage is bounded by safety valves `MITM_WS_MAX_MESSAGES_PER_FLOW` / `MITM_WS_MAX_MESSAGE_BYTES` (`0` = unlimited, the default; `--ws-max-messages` / `--ws-max-bytes` CLI equivalents). Dropped/truncated frames are counted (`dropped_count`, `truncated_any`) and `export_har` flags affected flows in `warnings`/`ws_partial_flows`, since their HAR `_webSocketMessages` are partial approximations. HAR re-import preserves the 101 handshake but not frames (upstream mitmproxy `FlowReader` limitation).
 
 ### Modification & Interception
 
